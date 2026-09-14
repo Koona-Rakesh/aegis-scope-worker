@@ -1,6 +1,6 @@
 # AegisScope scanner worker
 
-Private Render deployment source for the Milestone 2 scanner worker.
+Open-source deployment source for the Milestone 2 scanner worker.
 
 The worker runs the official OWASP ZAP stable image and accepts only authorized
 Standard scans from the AegisScope control plane. It enforces one verified HTTPS
@@ -18,15 +18,32 @@ callbacks, and handles Render shutdown signals safely.
 - One-hour runtime ceiling and safe operator stop polling
 - No credentials, tokens, or secrets stored in Git
 
-## Render
+## Free local development
 
-`render.yaml` defines one Docker background worker in Singapore on the `1c-2g`
-plan. Render generates the local ZAP API key. Set `SCANNER_CALLBACK_TOKEN` in
-the Blueprint setup form to the same secret configured on the AegisScope Site.
+Install Podman Desktop/Podman Engine (or Docker Engine where its license fits),
+copy `.env.example` to `.env`, replace both secrets, and start the worker:
 
-Background workers do not have a free compute plan. The `1c-2g` plan is chosen
-because OWASP ZAP is a Java application and 512 MB is not a sustainable memory
-ceiling for crawling and passive analysis.
+```sh
+podman compose up --build -d
+```
+
+Configure the AegisScope Site's `SCANNER_CALLBACK_TOKEN` with the exact same
+value. The worker uses the existing computer's CPU and memory, so there is no
+cloud-worker subscription. It processes jobs only while that computer is on.
+
+Set `RUN_ONCE=true` to claim at most one queued job and then exit. This supports
+future event-driven runners without turning the worker into a permanent server.
+
+## Production without a hosting subscription
+
+Run the same Compose service on an existing company server, workstation, NAS,
+or VM. There is no paid AegisScope or scanner software dependency, but the
+machine, electricity, network, patching, and backups remain operational costs.
+
+GitHub-hosted Actions are another development option. Standard runners are free
+for public repositories; private repositories have a monthly minute allowance.
+The repository remains private and scheduled scans remain disabled until the
+owner explicitly chooses that tradeoff.
 
 ## Local checks
 
