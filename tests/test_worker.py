@@ -65,6 +65,12 @@ class WorkerPolicyTests(unittest.TestCase):
         self.assertEqual(len(finding["fingerprint"]), 64)
         self.assertEqual(len(finding["remediation"]), 2)
 
+    def test_boolean_env(self):
+        with patch.dict(worker.os.environ, {"RUN_ONCE": "true"}, clear=False):
+            self.assertTrue(worker.boolean_env("RUN_ONCE"))
+        with patch.dict(worker.os.environ, {"RUN_ONCE": "0"}, clear=False):
+            self.assertFalse(worker.boolean_env("RUN_ONCE"))
+
 
 if __name__ == "__main__":
     unittest.main()
