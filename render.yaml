@@ -1,0 +1,24 @@
+services:
+  - type: worker
+    name: aegis-scope-scanner
+    runtime: docker
+    plan: 1c-2g
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: checksPass
+    maxShutdownDelaySeconds: 120
+    envVars:
+      - key: CONTROL_PLANE_URL
+        value: https://aegis-scope.rakesh181236.chatgpt.site
+      - key: SCANNER_CALLBACK_TOKEN
+        sync: false
+      - key: ZAP_API_KEY
+        generateValue: true
+      - key: MAX_SCAN_SECONDS
+        value: "3600"
+      - key: POLL_SECONDS
+        value: "5"
+
+previews:
+  generation: off
