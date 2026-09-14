@@ -43,6 +43,7 @@ class Config:
     zap_url: str
     poll_seconds: float
     max_scan_seconds: int
+    run_once: bool
 
 
 shutdown_requested = False
@@ -65,6 +66,13 @@ def bounded_number(name: str, fallback: float, minimum: float, maximum: float) -
     return max(minimum, min(maximum, value))
 
 
+def boolean_env(name: str, fallback: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return fallback
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def load_config() -> Config:
     worker_suffix = os.environ.get("RENDER_INSTANCE_ID") or socket.gethostname() or uuid.uuid4().hex[:8]
     return Config(
@@ -75,6 +83,7 @@ def load_config() -> Config:
         zap_url=os.environ.get("ZAP_URL", "http://127.0.0.1:8080").rstrip("/"),
         poll_seconds=bounded_number("POLL_SECONDS", 5, 1, 60),
         max_scan_seconds=int(bounded_number("MAX_SCAN_SECONDS", 3600, 60, 7200)),
+        run_once=boolean_env("RUN_ONCE"),
     )
 
 
@@ -473,6 +482,10 @@ def main() -> int:
                 job = claim_job(config)
                 if job:
                     run_job(config, job)
+                    if config.run_once:
+                        break
+                elif config.run_once:
+                    break
                 else:
                     sleep_interruptibly(config.poll_seconds)
             except Exception as error:
