@@ -2,6 +2,8 @@
 .github
 tests
 README.md
-render.yaml
+compose.yaml
+.env
+.env.example
 __pycache__
 *.pyc
