@@ -1,0 +1,20 @@
+services:
+  scanner:
+    build: .
+    environment:
+      CONTROL_PLANE_URL: ${CONTROL_PLANE_URL}
+      SCANNER_CALLBACK_TOKEN: ${SCANNER_CALLBACK_TOKEN}
+      ZAP_API_KEY: ${ZAP_API_KEY}
+      WORKER_ID: ${WORKER_ID:-local-zap-worker}
+      MAX_SCAN_SECONDS: ${MAX_SCAN_SECONDS:-3600}
+      POLL_SECONDS: ${POLL_SECONDS:-5}
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 2g
+    cpus: 1.0
+    restart: unless-stopped
