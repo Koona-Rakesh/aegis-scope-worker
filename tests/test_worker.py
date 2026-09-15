@@ -76,6 +76,7 @@ class WorkerPolicyTests(unittest.TestCase):
         config = worker.Config(
             control_plane_url="https://control.example",
             worker_token="token",
+            site_dispatch_token="dispatch-token",
             zap_api_key="zap-key",
             worker_id="test-worker",
             zap_url="http://127.0.0.1:8080",
@@ -86,7 +87,10 @@ class WorkerPolicyTests(unittest.TestCase):
         worker.control(config, "POST", "/api/internal/jobs/claim", {"workerId": "test-worker"})
         self.assertEqual(
             json_request.call_args.kwargs["headers"],
-            {"x-aegis-scanner-token": "token"},
+            {
+                "x-aegis-scanner-token": "token",
+                "oai-sites-authorization": "Bearer dispatch-token",
+            },
         )
 
     @patch.object(worker, "sleep_interruptibly")
@@ -105,6 +109,7 @@ class WorkerPolicyTests(unittest.TestCase):
         load_config.return_value = worker.Config(
             control_plane_url="https://control.example",
             worker_token="token",
+            site_dispatch_token="dispatch-token",
             zap_api_key="zap-key",
             worker_id="test-worker",
             zap_url="http://127.0.0.1:8080",
