@@ -1,6 +1,10 @@
 name: Passive scanner
 
 on:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/scanner.yml"
   schedule:
     - cron: "3/5 * * * *"
   workflow_dispatch:
