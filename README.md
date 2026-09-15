@@ -21,14 +21,14 @@ callbacks, and handles Render shutdown signals safely.
 ## Free local development
 
 Install Podman Desktop/Podman Engine (or Docker Engine where its license fits),
-copy `.env.example` to `.env`, replace both secrets, and start the worker:
+copy `.env.example` to `.env`, configure the scanner, Sites dispatch, and ZAP secrets, and start the worker:
 
 ```sh
 podman compose up --build -d
 ```
 
 Configure the AegisScope Site's `SCANNER_CALLBACK_TOKEN` with the exact same
-value. The worker uses the existing computer's CPU and memory, so there is no
+value. Set `SITE_DISPATCH_TOKEN` to the private Site's machine-access credential. The worker uses the existing computer's CPU and memory, so there is no
 cloud-worker subscription. It processes jobs only while that computer is on.
 
 Set `RUN_ONCE=true` to claim at most one queued job and then exit. This supports
@@ -42,8 +42,8 @@ machine, electricity, network, patching, and backups remain operational costs.
 
 GitHub-hosted Actions are another development option. Standard runners are free
 for public repositories; private repositories have a monthly minute allowance.
-The repository remains private and scheduled scans remain disabled until the
-owner explicitly chooses that tradeoff.
+This public repository uses encrypted Actions secrets; scheduled scans remain
+disabled until all private access credentials are installed and tested.
 
 ## Local checks
 
