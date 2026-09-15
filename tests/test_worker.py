@@ -2,7 +2,7 @@ import importlib.util
 import pathlib
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 SPEC = importlib.util.spec_from_file_location("worker", pathlib.Path(__file__).parents[1] / "worker.py")
@@ -70,6 +70,34 @@ class WorkerPolicyTests(unittest.TestCase):
             self.assertTrue(worker.boolean_env("RUN_ONCE"))
         with patch.dict(worker.os.environ, {"RUN_ONCE": "0"}, clear=False):
             self.assertFalse(worker.boolean_env("RUN_ONCE"))
+
+    @patch.object(worker, "sleep_interruptibly")
+    @patch.object(worker, "shutdown_zap")
+    @patch.object(worker, "wait_for_zap")
+    @patch.object(worker, "start_zap")
+    @patch.object(worker, "load_config")
+    def test_run_once_exits_after_control_plane_error(
+        self,
+        load_config,
+        start_zap,
+        _wait_for_zap,
+        _shutdown_zap,
+        sleep_interruptibly,
+    ):
+        load_config.return_value = worker.Config(
+            control_plane_url="https://control.example",
+            worker_token="token",
+            zap_api_key="zap-key",
+            worker_id="test-worker",
+            zap_url="http://127.0.0.1:8080",
+            poll_seconds=2,
+            max_scan_seconds=60,
+            run_once=True,
+        )
+        start_zap.return_value = Mock()
+        with patch.object(worker, "claim_job", side_effect=RuntimeError("HTTP 401")):
+            self.assertEqual(worker.main(), 1)
+        sleep_interruptibly.assert_not_called()
 
 
 if __name__ == "__main__":
