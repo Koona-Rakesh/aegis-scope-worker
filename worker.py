@@ -38,6 +38,7 @@ class ShutdownRequestedError(RuntimeError):
 class Config:
     control_plane_url: str
     worker_token: str
+    site_dispatch_token: str
     zap_api_key: str
     worker_id: str
     zap_url: str
@@ -78,6 +79,7 @@ def load_config() -> Config:
     return Config(
         control_plane_url=required("CONTROL_PLANE_URL").rstrip("/"),
         worker_token=required("SCANNER_CALLBACK_TOKEN"),
+        site_dispatch_token=required("SITE_DISPATCH_TOKEN"),
         zap_api_key=required("ZAP_API_KEY"),
         worker_id=os.environ.get("WORKER_ID", f"render-zap-{worker_suffix}")[:100],
         zap_url=os.environ.get("ZAP_URL", "http://127.0.0.1:8080").rstrip("/"),
@@ -137,7 +139,10 @@ def control(config: Config, method: str, path: str, body: dict[str, Any] | None 
     return json_request(
         f"{config.control_plane_url}{path}",
         method=method,
-        headers={"x-aegis-scanner-token": config.worker_token},
+        headers={
+            "x-aegis-scanner-token": config.worker_token,
+            "oai-sites-authorization": f"Bearer {config.site_dispatch_token}",
+        },
         body=body,
         allow_empty=allow_empty,
     )
