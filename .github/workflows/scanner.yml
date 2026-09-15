@@ -53,4 +53,4 @@ jobs:
             -e POLL_SECONDS \
             aegis-scope-scanner:run
 
-# Temporary connection check after AegisScope environment revision 5.
+# Temporary connection check after AegisScope environment revision 6.
