@@ -490,6 +490,8 @@ def main() -> int:
                     sleep_interruptibly(config.poll_seconds)
             except Exception as error:
                 log("worker_loop_error", message=str(error))
+                if config.run_once:
+                    return 1
                 sleep_interruptibly(config.poll_seconds)
         return 0
     finally:
