@@ -52,3 +52,5 @@ jobs:
             -e MAX_SCAN_SECONDS \
             -e POLL_SECONDS \
             aegis-scope-scanner:run
+
+# Temporary connection check after AegisScope environment revision 5.
