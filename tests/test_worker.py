@@ -71,6 +71,24 @@ class WorkerPolicyTests(unittest.TestCase):
         with patch.dict(worker.os.environ, {"RUN_ONCE": "0"}, clear=False):
             self.assertFalse(worker.boolean_env("RUN_ONCE"))
 
+    @patch.object(worker, "json_request")
+    def test_control_uses_private_site_safe_token_header(self, json_request):
+        config = worker.Config(
+            control_plane_url="https://control.example",
+            worker_token="token",
+            zap_api_key="zap-key",
+            worker_id="test-worker",
+            zap_url="http://127.0.0.1:8080",
+            poll_seconds=2,
+            max_scan_seconds=60,
+            run_once=True,
+        )
+        worker.control(config, "POST", "/api/internal/jobs/claim", {"workerId": "test-worker"})
+        self.assertEqual(
+            json_request.call_args.kwargs["headers"],
+            {"x-aegis-scanner-token": "token"},
+        )
+
     @patch.object(worker, "sleep_interruptibly")
     @patch.object(worker, "shutdown_zap")
     @patch.object(worker, "wait_for_zap")
