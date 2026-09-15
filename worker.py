@@ -137,7 +137,7 @@ def control(config: Config, method: str, path: str, body: dict[str, Any] | None 
     return json_request(
         f"{config.control_plane_url}{path}",
         method=method,
-        headers={"authorization": f"Bearer {config.worker_token}"},
+        headers={"x-aegis-scanner-token": config.worker_token},
         body=body,
         allow_empty=allow_empty,
     )
