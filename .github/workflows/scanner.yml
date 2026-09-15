@@ -1,6 +1,8 @@
 name: Passive scanner
 
 on:
+  schedule:
+    - cron: "3/5 * * * *"
   workflow_dispatch:
 
 permissions:
