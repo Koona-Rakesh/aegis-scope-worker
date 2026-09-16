@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""AegisScope Milestone 2 passive scanner worker.
+"""AegisScope controlled web security scanner worker.
 
 The worker claims authorized jobs from the AegisScope control plane and drives
 the OWASP ZAP daemon bundled in the official stable container image. It only
-accepts Standard, non-destructive scans against one verified HTTPS origin.
+accepts Standard passive scans and tightly bounded Basic active scans against
+one verified HTTPS origin.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import signal
@@ -24,6 +26,12 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from typing import Any
+
+
+BASIC_ACTIVE_RULE_IDS = frozenset({"40012", "40018"})
+BASIC_MAX_REQUESTS = 250
+BASIC_MAX_DURATION_SECONDS = 600
+BASIC_MAX_ENDPOINTS = 20
 
 
 class StopRequestedError(RuntimeError):
@@ -246,10 +254,37 @@ def enforce_policy(job: dict[str, Any]) -> tuple[str, str]:
         raise RuntimeError("Worker accepts only non-destructive policies")
     if origin not in (policy.get("allowedOrigins") or []):
         raise RuntimeError("Job origin is outside its allowlist")
-    if job.get("mode") != "standard":
-        raise RuntimeError("Milestone 2 permits Standard passive assessments only")
+    mode = job.get("mode")
+    if mode not in ("standard", "basic"):
+        raise RuntimeError("Worker permits only Standard and Basic assessments")
+    if mode == "standard" and policy.get("activeScan") not in (None, False):
+        raise RuntimeError("Standard assessments must remain passive")
+    if mode == "basic":
+        validate_basic_policy(policy)
     assert_public_dns(hostname)
     return origin, hostname
+
+
+def policy_integer(policy: dict[str, Any], name: str, minimum: int, maximum: int) -> int:
+    value = policy.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > maximum:
+        raise RuntimeError(f"Basic policy {name} is outside its safe boundary")
+    return value
+
+
+def validate_basic_policy(policy: dict[str, Any]) -> None:
+    if policy.get("activeScan") is not True:
+        raise RuntimeError("Basic assessment requires an explicit active-scan policy")
+    rule_ids = {str(value) for value in (policy.get("allowedActiveRuleIds") or [])}
+    if not rule_ids or not rule_ids.issubset(BASIC_ACTIVE_RULE_IDS):
+        raise RuntimeError("Basic assessment requested a prohibited active rule")
+    if policy.get("allowedMethods") != ["GET"]:
+        raise RuntimeError("Basic assessment permits GET query parameters only")
+    policy_integer(policy, "maxRequests", 1, BASIC_MAX_REQUESTS)
+    policy_integer(policy, "maxDurationSeconds", 60, BASIC_MAX_DURATION_SECONDS)
+    policy_integer(policy, "maxEndpoints", 1, BASIC_MAX_ENDPOINTS)
+    if policy_integer(policy, "maxConcurrentRequests", 1, 1) != 1:
+        raise RuntimeError("Basic assessment permits one active request thread")
 
 
 def assert_public_dns(hostname: str) -> None:
@@ -278,6 +313,134 @@ def same_origin(value: str, origin: str) -> bool:
         )
     except (ValueError, AttributeError):
         return False
+
+
+def basic_active_targets(urls: list[str], origin: str, maximum: int) -> list[str]:
+    targets: list[str] = []
+    for value in urls:
+        if not same_origin(value, origin):
+            continue
+        try:
+            parsed = urllib.parse.urlsplit(value)
+        except ValueError:
+            continue
+        if not urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+            continue
+        normalized = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
+        if normalized not in targets:
+            targets.append(normalized)
+        if len(targets) >= maximum:
+            break
+    return targets
+
+
+def zap_message_count(config: Config) -> int:
+    payload = zap(config, "core/view/numberOfMessages")
+    return max(0, int(payload.get("numberOfMessages", 0)))
+
+
+def stop_active_scan(config: Config, scan_id: str | None) -> None:
+    if not scan_id:
+        return
+    try:
+        zap(config, "ascan/action/stop", {"scanId": scan_id})
+    except Exception:
+        pass
+
+
+def basic_control_check(config: Config, job: dict[str, Any], scan_id: str | None) -> None:
+    if shutdown_requested:
+        stop_active_scan(config, scan_id)
+        raise ShutdownRequestedError("Worker is shutting down")
+    response = control(
+        config,
+        "GET",
+        f"/api/internal/jobs/{job['id']}/control?workerId={urllib.parse.quote(config.worker_id)}",
+    )
+    if response and response.get("stopRequested"):
+        stop_active_scan(config, scan_id)
+        raise StopRequestedError("Operator requested a safe stop")
+
+
+def run_basic_active_scan(
+    config: Config,
+    job: dict[str, Any],
+    origin: str,
+    discovered_urls: list[str],
+    endpoint_count: int,
+) -> tuple[int, bool]:
+    policy = job["policy"]
+    maximum_endpoints = policy_integer(policy, "maxEndpoints", 1, BASIC_MAX_ENDPOINTS)
+    targets = basic_active_targets(discovered_urls, origin, maximum_endpoints)
+    if not targets:
+        progress(config, current_job_id or job["id"], "No GET query parameters found; active checks skipped", 94,
+                 endpointsDiscovered=endpoint_count, requestsSent=endpoint_count)
+        return 0, False
+
+    rule_ids = sorted({str(value) for value in policy["allowedActiveRuleIds"]})
+    duration_seconds = policy_integer(policy, "maxDurationSeconds", 60, BASIC_MAX_DURATION_SECONDS)
+    request_budget = policy_integer(policy, "maxRequests", 1, BASIC_MAX_REQUESTS)
+    scan_policy_name = f"aegis-basic-{job['id']}"
+    zap(config, "ascan/action/addScanPolicy", {
+        "scanPolicyName": scan_policy_name,
+        "alertThreshold": "MEDIUM",
+        "attackStrength": "LOW",
+    })
+    zap(config, "ascan/action/disableAllScanners", {"scanPolicyName": scan_policy_name})
+    zap(config, "ascan/action/enableScanners", {
+        "ids": ",".join(rule_ids),
+        "scanPolicyName": scan_policy_name,
+    })
+    zap(config, "ascan/action/setOptionThreadPerHost", {"Integer": "1"})
+    zap(config, "ascan/action/setOptionMaxScanDurationInMins", {
+        "Integer": str(max(1, math.ceil(duration_seconds / 60))),
+    })
+    zap(config, "ascan/action/setOptionMaxRuleDurationInMins", {
+        "Integer": str(max(1, math.ceil(duration_seconds / 60))),
+    })
+
+    baseline_messages = zap_message_count(config)
+    deadline = time.monotonic() + duration_seconds
+    truncated = False
+    for index, target in enumerate(targets):
+        basic_control_check(config, job, None)
+        if time.monotonic() >= deadline or zap_message_count(config) - baseline_messages >= request_budget:
+            truncated = True
+            break
+        started = zap(config, "ascan/action/scan", {
+            "url": target,
+            "recurse": "false",
+            "inScopeOnly": "true",
+            "scanPolicyName": scan_policy_name,
+            "method": "GET",
+        })
+        active_scan_id = str(started.get("scan", ""))
+        if not active_scan_id:
+            raise RuntimeError("ZAP did not return an active scan id")
+        active_scan_completed = False
+        try:
+            while True:
+                basic_control_check(config, job, active_scan_id)
+                used = zap_message_count(config) - baseline_messages
+                if time.monotonic() >= deadline or used >= request_budget:
+                    truncated = True
+                    break
+                status = zap(config, "ascan/view/status", {"scanId": active_scan_id})
+                percent = max(0, min(100, int(float(status.get("status", 0)))))
+                overall = 70 + round(((index + percent / 100) / len(targets)) * 23)
+                progress(config, current_job_id or job["id"], "Bounded SQLi and XSS validation", min(93, overall),
+                         endpointsDiscovered=endpoint_count, requestsSent=endpoint_count + used)
+                if percent >= 100:
+                    active_scan_completed = True
+                    break
+                sleep_interruptibly(1.5)
+        finally:
+            if not active_scan_completed:
+                stop_active_scan(config, active_scan_id)
+        if truncated:
+            break
+    active_requests = max(0, zap_message_count(config) - baseline_messages)
+    return min(active_requests, request_budget), truncated
 
 
 def runtime_check(config: Config, job: dict[str, Any], spider_id: str, started_at: float) -> None:
@@ -402,6 +565,9 @@ def run_job(config: Config, job: dict[str, Any]) -> None:
     started_at = time.monotonic()
     spider_id: str | None = None
     endpoint_count = 0
+    discovered_urls: list[str] = []
+    active_requests = 0
+    active_truncated = False
     try:
         origin, _hostname = enforce_policy(job)
         progress(config, current_job_id, "Preparing isolated crawler", 4)
@@ -434,7 +600,10 @@ def run_job(config: Config, job: dict[str, Any]) -> None:
             status = zap(config, "spider/view/status", {"scanId": spider_id})
             percent = max(0, min(100, int(float(status.get("status", 0)))))
             results = zap(config, "spider/view/results", {"scanId": spider_id, "start": "0", "count": "10000"})
-            endpoint_count = len({url for url in results.get("results", []) if same_origin(str(url), origin)})
+            discovered_urls = list(dict.fromkeys(
+                str(url) for url in results.get("results", []) if same_origin(str(url), origin)
+            ))
+            endpoint_count = len(discovered_urls)
             progress(
                 config,
                 current_job_id,
@@ -465,6 +634,13 @@ def run_job(config: Config, job: dict[str, Any]) -> None:
                 break
             sleep_interruptibly(2.5)
 
+        if job.get("mode") == "basic":
+            progress(config, current_job_id, "Preparing bounded active validation", 68,
+                     endpointsDiscovered=endpoint_count, requestsSent=endpoint_count)
+            active_requests, active_truncated = run_basic_active_scan(
+                config, job, origin, discovered_urls, endpoint_count,
+            )
+
         result = zap(config, "core/view/alerts", {"baseurl": origin, "start": "0", "count": "5000"})
         scoped_alerts = [alert for alert in result.get("alerts", []) if same_origin(str(alert.get("url", "")), origin)]
         findings = normalize_alerts(scoped_alerts)
@@ -476,12 +652,15 @@ def run_job(config: Config, job: dict[str, Any]) -> None:
                 "findings": findings,
                 "stats": {
                     "endpointsDiscovered": endpoint_count,
-                    "requestsSent": endpoint_count,
+                    "requestsSent": endpoint_count + active_requests,
                     "candidatesFound": len(scoped_alerts),
+                    "activeRequests": active_requests,
+                    "activeTruncated": active_truncated,
                 },
             },
         )
-        log("job_completed", jobId=current_job_id, findings=len(findings))
+        log("job_completed", jobId=current_job_id, findings=len(findings), activeRequests=active_requests,
+            activeTruncated=active_truncated)
     except (StopRequestedError, ShutdownRequestedError) as error:
         if spider_id:
             try:
