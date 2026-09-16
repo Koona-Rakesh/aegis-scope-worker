@@ -65,6 +65,36 @@ class WorkerPolicyTests(unittest.TestCase):
         self.assertEqual(len(finding["fingerprint"]), 64)
         self.assertEqual(len(finding["remediation"]), 2)
 
+    def test_groups_same_risk_across_endpoints(self):
+        alerts = [
+            {"alert": "Strict-Transport-Security Header Not Set", "pluginId": "10035", "risk": "Medium", "url": "https://example.com/", "cweid": "319"},
+            {"alert": "Strict-Transport-Security Header Not Set", "pluginId": "10035", "risk": "Medium", "url": "https://example.com/app.js", "cweid": "319"},
+        ]
+        findings = worker.normalize_alerts(alerts)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["observationCount"], 2)
+        self.assertEqual(len(findings[0]["affectedEndpoints"]), 2)
+
+    def test_suppresses_document_controls_on_static_assets(self):
+        alerts = [
+            {"alert": "Missing Anti-clickjacking Header", "risk": "Medium", "url": "https://example.com/"},
+            {"alert": "Missing Anti-clickjacking Header", "risk": "Medium", "url": "https://example.com/favicon.svg"},
+            {"alert": "CSP: style-src unsafe-inline", "risk": "Low", "url": "https://example.com/sitemap.xml"},
+        ]
+        findings = worker.normalize_alerts(alerts)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["affectedEndpoints"], ["https://example.com/"])
+
+    def test_information_and_invalid_cwe_are_not_scored_as_low(self):
+        finding = worker.normalize_alert({
+            "alert": "Modern Web Application",
+            "risk": "Informational",
+            "url": "https://example.com/",
+            "cweid": "-1",
+        })
+        self.assertEqual(finding["severity"], "Info")
+        self.assertIsNone(finding["cwe"])
+
     def test_boolean_env(self):
         with patch.dict(worker.os.environ, {"RUN_ONCE": "true"}, clear=False):
             self.assertTrue(worker.boolean_env("RUN_ONCE"))
