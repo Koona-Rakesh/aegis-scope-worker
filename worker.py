@@ -308,6 +308,8 @@ def normalize_risk(value: Any) -> str:
         return "High"
     if risk == "medium":
         return "Medium"
+    if risk in ("info", "informational"):
+        return "Info"
     return "Low"
 
 
@@ -324,20 +326,46 @@ def truncate(value: str, length: int) -> str:
     return value if len(value) <= length else f"{value[:length - 1]}…"
 
 
+def is_html_document(endpoint: str) -> bool:
+    try:
+        path = urllib.parse.urlsplit(endpoint).path.lower()
+    except ValueError:
+        return True
+    if path == "/" or path.endswith("/"):
+        return True
+    leaf = path.rsplit("/", 1)[-1]
+    return "." not in leaf or leaf.endswith((".html", ".htm"))
+
+
+def is_applicable_alert(alert: dict[str, Any]) -> bool:
+    title = str(alert.get("alert") or "").lower()
+    document_only = any(marker in title for marker in (
+        "anti-clickjacking",
+        "x-frame-options",
+        "content security policy",
+        "sub resource integrity",
+    )) or title.startswith("csp:")
+    return not document_only or is_html_document(str(alert.get("url") or ""))
+
+
 def normalize_alert(alert: dict[str, Any]) -> dict[str, Any]:
     title = str(alert.get("alert") or "Security finding")
     endpoint = str(alert.get("url") or "")
     parameter = str(alert.get("param") or "")
     cwe_raw = str(alert.get("cweid") or "")
-    cwe = f"CWE-{cwe_raw}" if cwe_raw and cwe_raw != "0" else None
-    fingerprint = hashlib.sha256("|".join((title, endpoint, parameter, cwe or "")).encode()).hexdigest()
+    cwe = f"CWE-{cwe_raw}" if cwe_raw not in ("", "0", "-1") else None
+    plugin_id = str(alert.get("pluginId") or alert.get("alertRef") or "")
+    fingerprint = hashlib.sha256("|".join((plugin_id, title.lower().strip(), parameter.lower().strip(), cwe or "")).encode()).hexdigest()
     solution = [item.strip() for item in re.split(r"\r?\n+", str(alert.get("solution") or "")) if item.strip()]
     return {
         "fingerprint": fingerprint,
+        "pluginId": plugin_id or None,
         "title": title,
         "severity": normalize_risk(alert.get("risk")),
         "confidence": normalize_confidence(alert.get("confidence")),
         "endpoint": endpoint,
+        "observationCount": 1,
+        "affectedEndpoints": [endpoint],
         "parameter": parameter,
         "category": "Web application",
         "cwe": cwe,
@@ -345,6 +373,27 @@ def normalize_alert(alert: dict[str, Any]) -> dict[str, Any]:
         "impact": truncate(str(alert.get("description") or "The application exposes a security weakness that requires review."), 2000),
         "remediation": (solution or ["Review the affected response and apply the vendor-recommended security control."])[:12],
     }
+
+
+def normalize_alerts(alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    severity_order = {"Info": 0, "Low": 1, "Medium": 2, "High": 3, "Critical": 4}
+    confidence_order = {"Medium": 1, "High": 2, "Confirmed": 3}
+    groups: dict[str, dict[str, Any]] = {}
+    for alert in alerts:
+        if not is_applicable_alert(alert):
+            continue
+        finding = normalize_alert(alert)
+        existing = groups.get(finding["fingerprint"])
+        if existing is None:
+            groups[finding["fingerprint"]] = finding
+            continue
+        existing["affectedEndpoints"] = list(dict.fromkeys(existing["affectedEndpoints"] + finding["affectedEndpoints"]))
+        existing["observationCount"] = len(existing["affectedEndpoints"])
+        if severity_order[finding["severity"]] > severity_order[existing["severity"]]:
+            existing["severity"] = finding["severity"]
+        if confidence_order[finding["confidence"]] > confidence_order[existing["confidence"]]:
+            existing["confidence"] = finding["confidence"]
+    return list(groups.values())
 
 
 def run_job(config: Config, job: dict[str, Any]) -> None:
@@ -418,7 +467,7 @@ def run_job(config: Config, job: dict[str, Any]) -> None:
 
         result = zap(config, "core/view/alerts", {"baseurl": origin, "start": "0", "count": "5000"})
         scoped_alerts = [alert for alert in result.get("alerts", []) if same_origin(str(alert.get("url", "")), origin)]
-        findings = [normalize_alert(alert) for alert in scoped_alerts]
+        findings = normalize_alerts(scoped_alerts)
         complete(
             config,
             current_job_id,
