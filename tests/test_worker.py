@@ -13,6 +13,19 @@ SPEC.loader.exec_module(worker)
 
 
 class WorkerPolicyTests(unittest.TestCase):
+    def config(self):
+        return worker.Config(
+            control_plane_url="https://control.example",
+            worker_token="token",
+            site_dispatch_token="dispatch-token",
+            zap_api_key="zap-key",
+            worker_id="test-worker",
+            zap_url="http://127.0.0.1:8080",
+            poll_seconds=2,
+            max_scan_seconds=600,
+            run_once=True,
+        )
+
     def job(self):
         return {
             "id": "scan-1",
@@ -33,8 +46,140 @@ class WorkerPolicyTests(unittest.TestCase):
     def test_rejects_advanced_mode(self, _dns):
         job = self.job()
         job["mode"] = "advanced"
-        with self.assertRaisesRegex(RuntimeError, "Standard passive"):
+        with self.assertRaisesRegex(RuntimeError, "Standard and Basic"):
             worker.enforce_policy(job)
+
+    @patch.object(worker, "assert_public_dns")
+    def test_accepts_bounded_basic_policy(self, dns):
+        job = self.job()
+        job["mode"] = "basic"
+        job["policy"].update({
+            "activeScan": True,
+            "allowedActiveRuleIds": ["40012", "40018"],
+            "allowedMethods": ["GET"],
+            "maxRequests": 250,
+            "maxDurationSeconds": 600,
+            "maxEndpoints": 20,
+            "maxConcurrentRequests": 1,
+        })
+        self.assertEqual(worker.enforce_policy(job), ("https://example.com", "example.com"))
+        dns.assert_called_once_with("example.com")
+
+    @patch.object(worker, "assert_public_dns")
+    def test_rejects_prohibited_basic_rule(self, _dns):
+        job = self.job()
+        job["mode"] = "basic"
+        job["policy"].update({
+            "activeScan": True,
+            "allowedActiveRuleIds": ["40018", "90020"],
+            "allowedMethods": ["GET"],
+            "maxRequests": 250,
+            "maxDurationSeconds": 600,
+            "maxEndpoints": 20,
+            "maxConcurrentRequests": 1,
+        })
+        with self.assertRaisesRegex(RuntimeError, "prohibited active rule"):
+            worker.enforce_policy(job)
+
+    @patch.object(worker, "assert_public_dns")
+    def test_rejects_post_body_active_policy(self, _dns):
+        job = self.job()
+        job["mode"] = "basic"
+        job["policy"].update({
+            "activeScan": True,
+            "allowedActiveRuleIds": ["40012"],
+            "allowedMethods": ["GET", "POST"],
+            "maxRequests": 100,
+            "maxDurationSeconds": 300,
+            "maxEndpoints": 5,
+            "maxConcurrentRequests": 1,
+        })
+        with self.assertRaisesRegex(RuntimeError, "GET query parameters only"):
+            worker.enforce_policy(job)
+
+    def test_basic_targets_only_include_same_origin_query_urls(self):
+        urls = [
+            "https://example.com/",
+            "https://example.com/search?q=one#fragment",
+            "https://example.com/search?q=one",
+            "https://example.com/item?id=2",
+            "https://third-party.example/search?q=one",
+        ]
+        self.assertEqual(worker.basic_active_targets(urls, "https://example.com", 20), [
+            "https://example.com/search?q=one",
+            "https://example.com/item?id=2",
+        ])
+
+    def test_basic_targets_honor_endpoint_cap(self):
+        urls = [f"https://example.com/item?id={index}" for index in range(10)]
+        self.assertEqual(len(worker.basic_active_targets(urls, "https://example.com", 3)), 3)
+
+    @patch.object(worker, "progress")
+    @patch.object(worker, "control", return_value={})
+    @patch.object(worker, "zap")
+    def test_basic_scan_enables_only_approved_rules_and_get(self, zap, _control, _progress):
+        job = self.job()
+        job["mode"] = "basic"
+        job["policy"].update({
+            "activeScan": True,
+            "allowedActiveRuleIds": ["40018", "40012"],
+            "allowedMethods": ["GET"],
+            "maxRequests": 20,
+            "maxDurationSeconds": 120,
+            "maxEndpoints": 2,
+            "maxConcurrentRequests": 1,
+        })
+        message_counts = iter([10, 10, 11, 11])
+
+        def response(_config, path, params=None):
+            if path == "core/view/numberOfMessages":
+                return {"numberOfMessages": str(next(message_counts))}
+            if path == "ascan/action/scan":
+                return {"scan": "7"}
+            if path == "ascan/view/status":
+                return {"status": "100"}
+            return {}
+
+        zap.side_effect = response
+        requests, truncated = worker.run_basic_active_scan(
+            self.config(), job, "https://example.com", ["https://example.com/search?q=test"], 1,
+        )
+        self.assertEqual((requests, truncated), (1, False))
+        enabled = [call for call in zap.call_args_list if call.args[1] == "ascan/action/enableScanners"]
+        self.assertEqual(enabled[0].args[2]["ids"], "40012,40018")
+        scans = [call for call in zap.call_args_list if call.args[1] == "ascan/action/scan"]
+        self.assertEqual(scans[0].args[2]["method"], "GET")
+
+    @patch.object(worker, "progress")
+    @patch.object(worker, "control", return_value={})
+    @patch.object(worker, "zap")
+    def test_basic_scan_stops_at_request_budget(self, zap, _control, _progress):
+        job = self.job()
+        job["mode"] = "basic"
+        job["policy"].update({
+            "activeScan": True,
+            "allowedActiveRuleIds": ["40012"],
+            "allowedMethods": ["GET"],
+            "maxRequests": 1,
+            "maxDurationSeconds": 120,
+            "maxEndpoints": 1,
+            "maxConcurrentRequests": 1,
+        })
+        message_counts = iter([20, 20, 21, 21])
+
+        def response(_config, path, params=None):
+            if path == "core/view/numberOfMessages":
+                return {"numberOfMessages": str(next(message_counts))}
+            if path == "ascan/action/scan":
+                return {"scan": "8"}
+            return {}
+
+        zap.side_effect = response
+        self.assertEqual(worker.run_basic_active_scan(
+            self.config(), job, "https://example.com", ["https://example.com/search?q=test"], 1,
+        ), (1, True))
+        stopped = [call for call in zap.call_args_list if call.args[1] == "ascan/action/stop"]
+        self.assertEqual(stopped[0].args[2]["scanId"], "8")
 
     @patch.object(worker, "assert_public_dns")
     def test_rejects_origin_outside_allowlist(self, _dns):
