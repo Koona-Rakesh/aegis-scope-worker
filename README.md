@@ -3,10 +3,10 @@
 Open-source deployment source for the AegisScope scanner worker.
 
 The worker runs the official OWASP ZAP stable image and accepts authorized
-Standard passive scans plus bounded Basic scans from the AegisScope control
-plane. It enforces one verified HTTPS origin, blocks private/reserved DNS
-answers, normalizes findings, renews job leases through progress callbacks, and
-handles shutdown signals safely.
+Standard passive scans, bounded Basic scans and separate safe resilience
+observations from the AegisScope control plane. It enforces one verified HTTPS
+origin, blocks private/reserved DNS answers, normalizes findings, renews job
+leases through progress callbacks, and handles shutdown signals safely.
 
 ## Safety boundary
 
@@ -15,6 +15,8 @@ handles shutdown signals safely.
 - Basic active checks are limited to discovered GET query parameters
 - Basic limits: one thread, 20 endpoints, 250 requests, ten minutes
 - POST bodies, cookies, headers, uploads, time-based rules and denial-of-service patterns are excluded
+- Safe resilience is a separate mode: 12 sequential GET requests, 500 ms minimum spacing, 30 seconds maximum
+- Safe resilience requires an explicit staging-or-maintenance confirmation and aborts on 5xx, slow responses, request failures or out-of-scope redirects
 - Exact verified HTTPS origin and control-plane allowlist required
 - Private, reserved, loopback, multicast, and link-local DNS answers rejected
 - ZAP API listens on `127.0.0.1` with a generated API key
@@ -48,13 +50,15 @@ GitHub-hosted Actions are the current zero-subscription development runner. The
 public repository runs one isolated job at a time on its schedule; an owner-only
 dispatch sentinel can start a queued job when free schedules are delayed.
 
-## Basic engine validation
+## Basic and resilience engine validation
 
 The `Basic engine validation` workflow starts an intentionally vulnerable
 application and ZAP inside the same network-disabled container. The fixture is
 bound to loopback only and is never deployed. The build fails unless release
 rules 40012 (reflected XSS) and 40018 (SQL injection) are both detected without
-exceeding the 250-request Basic safety budget.
+exceeding the 250-request Basic safety budget. The same isolated run also fails
+unless the safe resilience observer detects an intentional HTTP 429 throttle in
+no more than 12 sequential requests.
 
 ## Local checks
 

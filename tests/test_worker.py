@@ -46,7 +46,7 @@ class WorkerPolicyTests(unittest.TestCase):
     def test_rejects_advanced_mode(self, _dns):
         job = self.job()
         job["mode"] = "advanced"
-        with self.assertRaisesRegex(RuntimeError, "Standard and Basic"):
+        with self.assertRaisesRegex(RuntimeError, "Standard, Basic and Safe resilience"):
             worker.enforce_policy(job)
 
     @patch.object(worker, "assert_public_dns")
@@ -64,6 +64,40 @@ class WorkerPolicyTests(unittest.TestCase):
         })
         self.assertEqual(worker.enforce_policy(job), ("https://example.com", "example.com"))
         dns.assert_called_once_with("example.com")
+
+    @patch.object(worker, "assert_public_dns")
+    def test_accepts_safe_resilience_policy(self, dns):
+        job = self.job()
+        job["mode"] = "resilience"
+        job["policy"].update({
+            "activeScan": False,
+            "resilienceObservation": True,
+            "allowedMethods": ["GET"],
+            "maxRequests": 12,
+            "maxDurationSeconds": 30,
+            "intervalMilliseconds": 500,
+            "maxConcurrentRequests": 1,
+            "stagingOrMaintenanceConfirmed": True,
+        })
+        self.assertEqual(worker.enforce_policy(job), ("https://example.com", "example.com"))
+        dns.assert_called_once_with("example.com")
+
+    @patch.object(worker, "assert_public_dns")
+    def test_rejects_resilience_request_volume_above_ceiling(self, _dns):
+        job = self.job()
+        job["mode"] = "resilience"
+        job["policy"].update({
+            "activeScan": False,
+            "resilienceObservation": True,
+            "allowedMethods": ["GET"],
+            "maxRequests": 13,
+            "maxDurationSeconds": 30,
+            "intervalMilliseconds": 500,
+            "maxConcurrentRequests": 1,
+            "stagingOrMaintenanceConfirmed": True,
+        })
+        with self.assertRaisesRegex(RuntimeError, "maxRequests"):
+            worker.enforce_policy(job)
 
     @patch.object(worker, "assert_public_dns")
     def test_rejects_prohibited_basic_rule(self, _dns):
@@ -180,6 +214,43 @@ class WorkerPolicyTests(unittest.TestCase):
         ), (1, True))
         stopped = [call for call in zap.call_args_list if call.args[1] == "ascan/action/stop"]
         self.assertEqual(stopped[0].args[2]["scanId"], "8")
+
+    @patch.object(worker, "sleep_interruptibly")
+    @patch.object(worker, "basic_control_check")
+    @patch.object(worker, "progress")
+    @patch.object(worker, "scoped_get")
+    def test_resilience_observer_stops_on_throttling_signal(
+        self,
+        scoped_get,
+        _progress,
+        _control_check,
+        _sleep,
+    ):
+        scoped_get.side_effect = [
+            {"status": 200, "latencySeconds": 0.05, "rateHeaders": {}},
+            {"status": 200, "latencySeconds": 0.06, "rateHeaders": {}},
+            {"status": 429, "latencySeconds": 0.04, "rateHeaders": {"retry-after": "5"}},
+        ]
+        job = self.job()
+        job["mode"] = "resilience"
+        job["policy"].update({
+            "activeScan": False,
+            "resilienceObservation": True,
+            "allowedMethods": ["GET"],
+            "maxRequests": 12,
+            "maxDurationSeconds": 30,
+            "intervalMilliseconds": 500,
+            "maxConcurrentRequests": 1,
+            "stagingOrMaintenanceConfirmed": True,
+        })
+        observation = worker.run_resilience_observation(
+            self.config(), job, "https://example.com",
+        )
+        self.assertTrue(observation["observed"])
+        self.assertEqual(observation["requestsSent"], 3)
+        self.assertEqual(observation["statuses"], [200, 200, 429])
+        self.assertEqual(observation["finding"]["severity"], "Info")
+        self.assertIn("Rate limiting observed", observation["finding"]["title"])
 
     @patch.object(worker, "assert_public_dns")
     def test_rejects_origin_outside_allowlist(self, _dns):

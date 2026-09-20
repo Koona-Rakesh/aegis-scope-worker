@@ -1,4 +1,4 @@
-name: Basic engine validation
+name: Basic and resilience engine validation
 
 on:
   workflow_dispatch:
@@ -28,7 +28,7 @@ jobs:
       - name: Build isolated scanner
         run: docker build --pull --tag aegis-scope-scanner:validation .
 
-      - name: Validate SQLi and reflected XSS rules
+      - name: Validate SQLi, reflected XSS and safe rate limiting
         run: |
           docker run --rm \
             --network none \
@@ -44,4 +44,3 @@ jobs:
             --entrypoint python3 \
             aegis-scope-scanner:validation \
             /opt/aegis-tests/lab_validation.py
-

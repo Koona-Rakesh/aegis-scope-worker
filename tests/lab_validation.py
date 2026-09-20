@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the bounded Basic engine against the loopback-only lab."""
+"""Validate bounded Basic and safe resilience engines against the loopback lab."""
 
 from __future__ import annotations
 
@@ -95,6 +95,30 @@ def main() -> int:
             raise AssertionError(f"Active request count {active_requests} violated the validation budget")
         if truncated:
             raise AssertionError("Basic engine exhausted its safety budget in the two-endpoint lab")
+        resilience_job = {
+            "id": "loopback-resilience-lab",
+            "mode": "resilience",
+            "policy": {
+                "activeScan": False,
+                "resilienceObservation": True,
+                "allowedMethods": ["GET"],
+                "maxRequests": 12,
+                "maxDurationSeconds": 30,
+                "intervalMilliseconds": 500,
+                "maxConcurrentRequests": 1,
+                "stagingOrMaintenanceConfirmed": True,
+            },
+        }
+        resilience = worker.run_resilience_observation(
+            config,
+            resilience_job,
+            lab.origin,
+            f"{lab.origin}/rate-limit",
+        )
+        if not resilience["observed"]:
+            raise AssertionError("Safe resilience observer did not identify the lab throttle")
+        if resilience["requestsSent"] > 12 or resilience["truncated"]:
+            raise AssertionError("Safe resilience observer violated its request or health boundary")
         print(json.dumps({
             "status": "passed",
             "scope": "loopback-only",
@@ -103,6 +127,9 @@ def main() -> int:
             "activeRequests": active_requests,
             "requestBudget": 250,
             "truncated": truncated,
+            "rateLimitObserved": resilience["observed"],
+            "rateLimitRequests": resilience["requestsSent"],
+            "rateLimitRequestBudget": resilience["requestBudget"],
         }, separators=(",", ":")))
         return 0
     finally:
@@ -112,4 +139,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

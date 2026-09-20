@@ -3,8 +3,8 @@
 
 The worker claims authorized jobs from the AegisScope control plane and drives
 the OWASP ZAP daemon bundled in the official stable container image. It only
-accepts Standard passive scans and tightly bounded Basic active scans against
-one verified HTTPS origin.
+accepts Standard passive scans, tightly bounded Basic active scans, and a
+separate low-rate resilience observation against one verified HTTPS origin.
 """
 
 from __future__ import annotations
@@ -32,6 +32,18 @@ BASIC_ACTIVE_RULE_IDS = frozenset({"40012", "40018"})
 BASIC_MAX_REQUESTS = 250
 BASIC_MAX_DURATION_SECONDS = 600
 BASIC_MAX_ENDPOINTS = 20
+RESILIENCE_MAX_REQUESTS = 12
+RESILIENCE_MAX_DURATION_SECONDS = 30
+RESILIENCE_MIN_INTERVAL_MILLISECONDS = 500
+RATE_LIMIT_HEADERS = frozenset({
+    "ratelimit-limit",
+    "ratelimit-remaining",
+    "ratelimit-reset",
+    "retry-after",
+    "x-ratelimit-limit",
+    "x-ratelimit-remaining",
+    "x-ratelimit-reset",
+})
 
 
 class StopRequestedError(RuntimeError):
@@ -255,12 +267,14 @@ def enforce_policy(job: dict[str, Any]) -> tuple[str, str]:
     if origin not in (policy.get("allowedOrigins") or []):
         raise RuntimeError("Job origin is outside its allowlist")
     mode = job.get("mode")
-    if mode not in ("standard", "basic"):
-        raise RuntimeError("Worker permits only Standard and Basic assessments")
+    if mode not in ("standard", "basic", "resilience"):
+        raise RuntimeError("Worker permits only Standard, Basic and Safe resilience assessments")
     if mode == "standard" and policy.get("activeScan") not in (None, False):
         raise RuntimeError("Standard assessments must remain passive")
     if mode == "basic":
         validate_basic_policy(policy)
+    if mode == "resilience":
+        validate_resilience_policy(policy)
     assert_public_dns(hostname)
     return origin, hostname
 
@@ -285,6 +299,20 @@ def validate_basic_policy(policy: dict[str, Any]) -> None:
     policy_integer(policy, "maxEndpoints", 1, BASIC_MAX_ENDPOINTS)
     if policy_integer(policy, "maxConcurrentRequests", 1, 1) != 1:
         raise RuntimeError("Basic assessment permits one active request thread")
+
+
+def validate_resilience_policy(policy: dict[str, Any]) -> None:
+    if policy.get("activeScan") is not False or policy.get("resilienceObservation") is not True:
+        raise RuntimeError("Safe resilience requires its dedicated non-exploit policy")
+    if policy.get("allowedMethods") != ["GET"]:
+        raise RuntimeError("Safe resilience permits GET requests only")
+    if policy.get("stagingOrMaintenanceConfirmed") is not True:
+        raise RuntimeError("Safe resilience requires staging or an approved maintenance window")
+    policy_integer(policy, "maxRequests", 2, RESILIENCE_MAX_REQUESTS)
+    policy_integer(policy, "maxDurationSeconds", 5, RESILIENCE_MAX_DURATION_SECONDS)
+    policy_integer(policy, "intervalMilliseconds", RESILIENCE_MIN_INTERVAL_MILLISECONDS, 2_000)
+    if policy_integer(policy, "maxConcurrentRequests", 1, 1) != 1:
+        raise RuntimeError("Safe resilience permits one request thread")
 
 
 def assert_public_dns(hostname: str) -> None:
@@ -360,6 +388,187 @@ def basic_control_check(config: Config, job: dict[str, Any], scan_id: str | None
     if response and response.get("stopRequested"):
         stop_active_scan(config, scan_id)
         raise StopRequestedError("Operator requested a safe stop")
+
+
+class ScopedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, origin: str) -> None:
+        self.origin = origin
+        super().__init__()
+
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        fp: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> urllib.request.Request | None:
+        if not same_origin(new_url, self.origin):
+            raise RuntimeError("Safe resilience redirect left the verified origin")
+        return super().redirect_request(request, fp, code, message, headers, new_url)
+
+
+def scoped_get(endpoint: str, origin: str, timeout: float = 8) -> dict[str, Any]:
+    if not same_origin(endpoint, origin):
+        raise RuntimeError("Safe resilience endpoint left the verified origin")
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        ScopedRedirectHandler(origin),
+    )
+    request = urllib.request.Request(
+        endpoint,
+        method="GET",
+        headers={
+            "user-agent": "AegisScope-Resilience/0.1",
+            "cache-control": "no-cache",
+            "accept": "text/html,application/json;q=0.9,*/*;q=0.1",
+        },
+    )
+    started = time.monotonic()
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            response.read(1024)
+            status = response.status
+            headers = {key.lower(): value for key, value in response.headers.items()}
+    except urllib.error.HTTPError as error:
+        error.read(1024)
+        status = error.code
+        headers = {key.lower(): value for key, value in error.headers.items()}
+    return {
+        "status": int(status),
+        "latencySeconds": max(0.0, time.monotonic() - started),
+        "rateHeaders": {key: value for key, value in headers.items() if key in RATE_LIMIT_HEADERS},
+    }
+
+
+def resilience_finding(origin: str, observation: dict[str, Any]) -> dict[str, Any]:
+    statuses = observation["statuses"]
+    rate_headers = observation["rateHeaders"]
+    observed = observation["observed"]
+    stopped_reason = observation["stoppedReason"]
+    status_counts = {str(status): statuses.count(status) for status in sorted(set(statuses))}
+    maximum_latency_ms = round(max(observation["latenciesSeconds"] or [0]) * 1000)
+    if observed:
+        title = "Rate limiting observed during safe sample"
+        confidence = "High"
+        impact = "The sampled endpoint returned an explicit throttling signal before the safety ceiling. This is a positive control observation, not a vulnerability."
+        remediation = [
+            "Document the observed threshold and confirm sensitive endpoints use equivalent or stricter server-side controls.",
+            "Keep denial-of-service and capacity testing in a separately approved staging exercise.",
+        ]
+    elif stopped_reason:
+        title = "Safe resilience observation stopped by health guard"
+        confidence = "High"
+        impact = "The observer stopped early because the target became slow, returned a server error, redirected out of scope or became unreachable. No load test was attempted."
+        remediation = [
+            "Review service health and logs for the observation window before any retest.",
+            "Retest only in staging or an approved maintenance window.",
+        ]
+    else:
+        title = "Rate limiting not observed within safe sample"
+        confidence = "Medium"
+        impact = "No explicit throttling signal appeared during this small sequential sample. This does not prove rate limiting is absent and is not a capacity or denial-of-service test."
+        remediation = [
+            "Apply server-side limits to sensitive unauthenticated endpoints and return 429 with a Retry-After or RateLimit header.",
+            "Validate endpoint-specific thresholds in staging; do not increase production traffic to force a failure.",
+        ]
+    evidence = (
+        f"Sequential GET sample {observation['requestsSent']}/{observation['requestBudget']}; "
+        f"interval {observation['intervalMilliseconds']} ms; statuses {json.dumps(status_counts, sort_keys=True)}; "
+        f"maximum latency {maximum_latency_ms} ms; rate-limit headers "
+        f"{json.dumps(rate_headers, sort_keys=True) if rate_headers else 'none'}; "
+        f"health stop {stopped_reason or 'none'}."
+    )
+    return {
+        "fingerprint": hashlib.sha256(f"aegis-rate-limit-v1|{origin}".encode()).hexdigest(),
+        "pluginId": "aegis-rate-limit-observer-v1",
+        "title": title,
+        "severity": "Info",
+        "confidence": confidence,
+        "endpoint": origin,
+        "observationCount": 1,
+        "affectedEndpoints": [origin],
+        "parameter": "",
+        "category": "Resilience",
+        "cwe": None,
+        "evidence": evidence,
+        "impact": impact,
+        "remediation": remediation,
+    }
+
+
+def run_resilience_observation(
+    config: Config,
+    job: dict[str, Any],
+    origin: str,
+    endpoint: str | None = None,
+) -> dict[str, Any]:
+    policy = job["policy"]
+    request_budget = policy_integer(policy, "maxRequests", 2, RESILIENCE_MAX_REQUESTS)
+    duration_seconds = policy_integer(policy, "maxDurationSeconds", 5, RESILIENCE_MAX_DURATION_SECONDS)
+    interval_milliseconds = policy_integer(
+        policy,
+        "intervalMilliseconds",
+        RESILIENCE_MIN_INTERVAL_MILLISECONDS,
+        2_000,
+    )
+    target = endpoint or f"{origin}/"
+    if not same_origin(target, origin):
+        raise RuntimeError("Safe resilience endpoint left the verified origin")
+    samples: list[dict[str, Any]] = []
+    rate_headers: dict[str, str] = {}
+    observed = False
+    stopped_reason: str | None = None
+    started = time.monotonic()
+    baseline_latency = 0.0
+    for index in range(request_budget):
+        basic_control_check(config, job, None)
+        if time.monotonic() - started >= duration_seconds:
+            stopped_reason = "time ceiling"
+            break
+        if index:
+            sleep_interruptibly(interval_milliseconds / 1000)
+        try:
+            sample = scoped_get(target, origin)
+        except Exception as error:
+            stopped_reason = f"request failure: {type(error).__name__}"
+            break
+        samples.append(sample)
+        if index == 0:
+            baseline_latency = sample["latencySeconds"]
+            if baseline_latency > 2.5:
+                stopped_reason = "slow baseline"
+        rate_headers.update(sample["rateHeaders"])
+        if sample["status"] == 429 or sample["rateHeaders"]:
+            observed = True
+        elif sample["status"] >= 500:
+            stopped_reason = f"server status {sample['status']}"
+        elif index and sample["latencySeconds"] > max(5.0, baseline_latency * 3):
+            stopped_reason = "latency guard"
+        progress(
+            config,
+            current_job_id or job["id"],
+            "Safe rate-limit observation",
+            min(95, 10 + round((len(samples) / request_budget) * 85)),
+            endpointsDiscovered=1,
+            requestsSent=len(samples),
+        )
+        if observed or stopped_reason:
+            break
+    observation = {
+        "observed": observed,
+        "requestsSent": len(samples),
+        "requestBudget": request_budget,
+        "intervalMilliseconds": interval_milliseconds,
+        "statuses": [sample["status"] for sample in samples],
+        "latenciesSeconds": [sample["latencySeconds"] for sample in samples],
+        "rateHeaders": rate_headers,
+        "stoppedReason": stopped_reason,
+        "truncated": bool(stopped_reason),
+    }
+    observation["finding"] = resilience_finding(origin, observation)
+    return observation
 
 
 def run_basic_active_scan(
@@ -570,6 +779,32 @@ def run_job(config: Config, job: dict[str, Any]) -> None:
     active_truncated = False
     try:
         origin, _hostname = enforce_policy(job)
+        if job.get("mode") == "resilience":
+            progress(config, current_job_id, "Preparing safe rate-limit observation", 5)
+            observation = run_resilience_observation(config, job, origin)
+            complete(
+                config,
+                current_job_id,
+                {
+                    "status": "completed",
+                    "findings": [observation["finding"]],
+                    "stats": {
+                        "endpointsDiscovered": 1,
+                        "requestsSent": observation["requestsSent"],
+                        "candidatesFound": 1,
+                        "activeRequests": observation["requestsSent"],
+                        "activeTruncated": observation["truncated"],
+                    },
+                },
+            )
+            log(
+                "resilience_job_completed",
+                jobId=current_job_id,
+                requests=observation["requestsSent"],
+                rateLimitObserved=observation["observed"],
+                stoppedReason=observation["stoppedReason"],
+            )
+            return
         progress(config, current_job_id, "Preparing isolated crawler", 4)
         zap(config, "core/action/newSession", {"name": "", "overwrite": "true"})
         context_name = f"aegis-{current_job_id}"

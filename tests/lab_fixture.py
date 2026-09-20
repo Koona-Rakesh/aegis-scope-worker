@@ -24,6 +24,7 @@ class VulnerableLab:
         )
         self._database.commit()
         self._lock = threading.Lock()
+        self._rate_limit_requests = 0
         lab = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -54,14 +55,29 @@ class VulnerableLab:
                         return
                     self._html("<br>".join(str(row[0]) for row in rows) or "No product")
                     return
+                if parsed.path == "/rate-limit":
+                    with lab._lock:
+                        lab._rate_limit_requests += 1
+                        request_number = lab._rate_limit_requests
+                    if request_number >= 5:
+                        self._html(
+                            "Safe lab threshold reached",
+                            status=429,
+                            headers={"Retry-After": "5", "RateLimit-Limit": "4"},
+                        )
+                        return
+                    self._html(f"Safe lab request {request_number}")
+                    return
                 self.send_error(404)
 
-            def _html(self, body: str, status: int = 200) -> None:
+            def _html(self, body: str, status: int = 200, headers: dict[str, str] | None = None) -> None:
                 payload = f"<!doctype html><html><body>{body}</body></html>".encode()
                 self.send_response(status)
                 self.send_header("content-type", "text/html; charset=utf-8")
                 self.send_header("content-length", str(len(payload)))
                 self.send_header("cache-control", "no-store")
+                for key, value in (headers or {}).items():
+                    self.send_header(key, value)
                 self.end_headers()
                 self.wfile.write(payload)
 
@@ -80,4 +96,3 @@ class VulnerableLab:
         self.server.server_close()
         self.thread.join(timeout=5)
         self._database.close()
-
