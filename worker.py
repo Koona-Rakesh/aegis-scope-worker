@@ -522,6 +522,7 @@ def run_resilience_observation(
     stopped_reason: str | None = None
     started = time.monotonic()
     baseline_latency = 0.0
+    hostname = str((job.get("target") or {}).get("hostname") or "").lower().rstrip(".")
     for index in range(request_budget):
         basic_control_check(config, job, None)
         if time.monotonic() - started >= duration_seconds:
@@ -529,6 +530,11 @@ def run_resilience_observation(
             break
         if index:
             sleep_interruptibly(interval_milliseconds / 1000)
+        if time.monotonic() - started >= duration_seconds:
+            stopped_reason = "time ceiling"
+            break
+        if hostname:
+            assert_public_dns(hostname)
         try:
             sample = scoped_get(target, origin)
         except Exception as error:

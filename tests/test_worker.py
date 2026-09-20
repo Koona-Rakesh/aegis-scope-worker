@@ -243,9 +243,10 @@ class WorkerPolicyTests(unittest.TestCase):
             "maxConcurrentRequests": 1,
             "stagingOrMaintenanceConfirmed": True,
         })
-        observation = worker.run_resilience_observation(
-            self.config(), job, "https://example.com",
-        )
+        with patch.object(worker, "assert_public_dns"):
+            observation = worker.run_resilience_observation(
+                self.config(), job, "https://example.com",
+            )
         self.assertTrue(observation["observed"])
         self.assertEqual(observation["requestsSent"], 3)
         self.assertEqual(observation["statuses"], [200, 200, 429])
