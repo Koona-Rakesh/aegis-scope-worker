@@ -48,6 +48,14 @@ GitHub-hosted Actions are the current zero-subscription development runner. The
 public repository runs one isolated job at a time on its schedule; an owner-only
 dispatch sentinel can start a queued job when free schedules are delayed.
 
+## Basic engine validation
+
+The `Basic engine validation` workflow starts an intentionally vulnerable
+application and ZAP inside the same network-disabled container. The fixture is
+bound to loopback only and is never deployed. The build fails unless release
+rules 40012 (reflected XSS) and 40018 (SQL injection) are both detected without
+exceeding the 250-request Basic safety budget.
+
 ## Local checks
 
 ```sh
