@@ -1,0 +1,47 @@
+name: Basic engine validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "worker.py"
+      - "tests/lab_fixture.py"
+      - "tests/lab_validation.py"
+      - ".github/workflows/engine-validation.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aegis-scope-basic-engine-validation
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out scanner
+        uses: actions/checkout@v4
+
+      - name: Build isolated scanner
+        run: docker build --pull --tag aegis-scope-scanner:validation .
+
+      - name: Validate SQLi and reflected XSS rules
+        run: |
+          docker run --rm \
+            --network none \
+            --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 512 \
+            --memory 2g \
+            --cpus 1.0 \
+            --stop-timeout 120 \
+            --volume "${{ github.workspace }}/tests:/opt/aegis-tests:ro" \
+            --entrypoint python3 \
+            aegis-scope-scanner:validation \
+            /opt/aegis-tests/lab_validation.py
+
