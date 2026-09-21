@@ -8,6 +8,7 @@ networking disabled.
 from __future__ import annotations
 
 import sqlite3
+import json
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,7 @@ class VulnerableLab:
         self._database.commit()
         self._lock = threading.Lock()
         self._rate_limit_requests = 0
+        self._openapi_requests = 0
         lab = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -68,6 +70,21 @@ class VulnerableLab:
                         return
                     self._html(f"Safe lab request {request_number}")
                     return
+                if parsed.path == "/openapi.json":
+                    with lab._lock:
+                        lab._openapi_requests += 1
+                    self._json({
+                        "openapi": "3.1.0",
+                        "info": {"title": "AegisScope loopback API", "version": "1.0.0"},
+                        "paths": {
+                            "/api/orders": {
+                                "get": {"operationId": "listOrders"},
+                                "post": {"operationId": "createOrder"},
+                            },
+                            "/api/orders/{id}": {"get": {"operationId": "getOrder"}},
+                        },
+                    })
+                    return
                 self.send_error(404)
 
             def _html(self, body: str, status: int = 200, headers: dict[str, str] | None = None) -> None:
@@ -78,6 +95,15 @@ class VulnerableLab:
                 self.send_header("cache-control", "no-store")
                 for key, value in (headers or {}).items():
                     self.send_header(key, value)
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def _json(self, body: dict[str, Any], status: int = 200) -> None:
+                payload = json.dumps(body, separators=(",", ":")).encode()
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.send_header("cache-control", "no-store")
                 self.end_headers()
                 self.wfile.write(payload)
 

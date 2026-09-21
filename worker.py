@@ -3,8 +3,9 @@
 
 The worker claims authorized jobs from the AegisScope control plane and drives
 the OWASP ZAP daemon bundled in the official stable container image. It only
-accepts Standard passive scans, tightly bounded Basic active scans, and a
-separate low-rate resilience observation against one verified HTTPS origin.
+accepts Standard passive scans, tightly bounded Basic active scans, a separate
+low-rate resilience observation, and passive OpenAPI inventory against one
+verified HTTPS origin.
 """
 
 from __future__ import annotations
@@ -35,6 +36,9 @@ BASIC_MAX_ENDPOINTS = 20
 RESILIENCE_MAX_REQUESTS = 12
 RESILIENCE_MAX_DURATION_SECONDS = 30
 RESILIENCE_MIN_INTERVAL_MILLISECONDS = 500
+API_MAX_DOCUMENT_BYTES = 2_000_000
+API_MAX_ENDPOINTS = 500
+OPENAPI_OPERATION_METHODS = frozenset({"get", "post", "put", "patch", "delete", "options", "head", "trace"})
 RATE_LIMIT_HEADERS = frozenset({
     "ratelimit-limit",
     "ratelimit-remaining",
@@ -267,14 +271,16 @@ def enforce_policy(job: dict[str, Any]) -> tuple[str, str]:
     if origin not in (policy.get("allowedOrigins") or []):
         raise RuntimeError("Job origin is outside its allowlist")
     mode = job.get("mode")
-    if mode not in ("standard", "basic", "resilience"):
-        raise RuntimeError("Worker permits only Standard, Basic and Safe resilience assessments")
+    if mode not in ("standard", "basic", "resilience", "api"):
+        raise RuntimeError("Worker permits only Standard, Basic, Safe resilience and passive API inventory assessments")
     if mode == "standard" and policy.get("activeScan") not in (None, False):
         raise RuntimeError("Standard assessments must remain passive")
     if mode == "basic":
         validate_basic_policy(policy)
     if mode == "resilience":
         validate_resilience_policy(policy)
+    if mode == "api":
+        validate_api_policy(policy, origin)
     assert_public_dns(hostname)
     return origin, hostname
 
@@ -313,6 +319,23 @@ def validate_resilience_policy(policy: dict[str, Any]) -> None:
     policy_integer(policy, "intervalMilliseconds", RESILIENCE_MIN_INTERVAL_MILLISECONDS, 2_000)
     if policy_integer(policy, "maxConcurrentRequests", 1, 1) != 1:
         raise RuntimeError("Safe resilience permits one request thread")
+
+
+def validate_api_policy(policy: dict[str, Any], origin: str) -> None:
+    if policy.get("activeScan") is not False or policy.get("apiDiscovery") is not True:
+        raise RuntimeError("API inventory requires its dedicated passive policy")
+    if policy.get("allowedMethods") != ["GET"] or policy.get("maxRequests") != 1:
+        raise RuntimeError("API inventory permits one OpenAPI document GET only")
+    if policy.get("resolveExternalReferences") is not False:
+        raise RuntimeError("API inventory cannot resolve external references")
+    policy_integer(policy, "maxDocumentBytes", 1, API_MAX_DOCUMENT_BYTES)
+    policy_integer(policy, "maxEndpoints", 1, API_MAX_ENDPOINTS)
+    document_url = str(policy.get("openApiUrl") or "")
+    if not same_origin(document_url, origin):
+        raise RuntimeError("OpenAPI document left the verified origin")
+    parsed = urllib.parse.urlsplit(document_url)
+    if parsed.scheme != "https" or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path in ("", "/"):
+        raise RuntimeError("OpenAPI document URL violates the passive inventory boundary")
 
 
 def assert_public_dns(hostname: str) -> None:
@@ -440,6 +463,117 @@ def scoped_get(endpoint: str, origin: str, timeout: float = 8) -> dict[str, Any]
         "latencySeconds": max(0.0, time.monotonic() - started),
         "rateHeaders": {key: value for key, value in headers.items() if key in RATE_LIMIT_HEADERS},
     }
+
+
+def parse_openapi_inventory(document: Any, origin: str, maximum: int) -> dict[str, Any]:
+    if not isinstance(document, dict):
+        raise RuntimeError("OpenAPI document must be a JSON object")
+    openapi_version = str(document.get("openapi") or "")
+    swagger_version = str(document.get("swagger") or "")
+    if not (openapi_version.startswith("3.") or swagger_version == "2.0"):
+        raise RuntimeError("Document is not OpenAPI 3.x or Swagger 2.0 JSON")
+    paths = document.get("paths")
+    if not isinstance(paths, dict):
+        raise RuntimeError("OpenAPI document does not contain a paths object")
+
+    operations: list[dict[str, str]] = []
+    method_counts: dict[str, int] = {}
+    truncated = False
+    for raw_path, path_item in paths.items():
+        if not isinstance(raw_path, str) or not raw_path.startswith("/") or not isinstance(path_item, dict):
+            continue
+        endpoint = urllib.parse.urljoin(f"{origin}/", raw_path.lstrip("/"))
+        if not same_origin(endpoint, origin):
+            continue
+        for raw_method, operation in path_item.items():
+            method = str(raw_method).lower()
+            if method not in OPENAPI_OPERATION_METHODS or not isinstance(operation, dict):
+                continue
+            if len(operations) >= maximum:
+                truncated = True
+                break
+            upper_method = method.upper()
+            operations.append({
+                "method": upper_method,
+                "path": raw_path,
+                "endpoint": endpoint,
+                "operationId": truncate(str(operation.get("operationId") or ""), 240),
+            })
+            method_counts[upper_method] = method_counts.get(upper_method, 0) + 1
+        if truncated:
+            break
+    return {
+        "version": openapi_version or swagger_version,
+        "title": truncate(str((document.get("info") or {}).get("title") or "Unnamed API"), 240) if isinstance(document.get("info"), dict) else "Unnamed API",
+        "operations": operations,
+        "methodCounts": method_counts,
+        "truncated": truncated,
+    }
+
+
+def openapi_inventory_finding(document_url: str, inventory: dict[str, Any], maximum: int) -> dict[str, Any]:
+    operations = inventory["operations"]
+    method_summary = ", ".join(f"{method} {count}" for method, count in sorted(inventory["methodCounts"].items())) or "none"
+    evidence = (
+        f"Read one same-origin OpenAPI JSON document. API: {inventory['title']}; "
+        f"specification: {inventory['version']}; operations: {len(operations)}/{maximum}; "
+        f"methods: {method_summary}; external references: not resolved; documented operations: not invoked."
+    )
+    if inventory["truncated"]:
+        evidence += " Inventory stopped at the operation safety ceiling."
+    return {
+        "fingerprint": hashlib.sha256(f"openapi-inventory|{document_url}".encode()).hexdigest(),
+        "pluginId": "aegis-openapi-inventory-v1",
+        "title": "OpenAPI inventory discovered",
+        "severity": "Info",
+        "confidence": "High",
+        "endpoint": document_url,
+        "observationCount": max(1, len(operations)),
+        "affectedEndpoints": [f"{item['method']} {item['endpoint']}" for item in operations],
+        "parameter": "",
+        "category": "API inventory",
+        "cwe": None,
+        "evidence": truncate(evidence, 8000),
+        "impact": "This is a passive API inventory, not a confirmed vulnerability. It establishes the reviewed operation scope for later authorized API security tests.",
+        "remediation": [
+            "Remove obsolete operations from the published specification and deployment.",
+            "Require explicit authorization before enabling authenticated or active tests for any inventoried operation.",
+            "Keep the specification free of embedded credentials and sensitive examples.",
+        ],
+    }
+
+
+def run_openapi_inventory(config: Config, job: dict[str, Any], origin: str) -> dict[str, Any]:
+    policy = job["policy"]
+    maximum_bytes = policy_integer(policy, "maxDocumentBytes", 1, API_MAX_DOCUMENT_BYTES)
+    maximum_endpoints = policy_integer(policy, "maxEndpoints", 1, API_MAX_ENDPOINTS)
+    document_url = str(policy.get("openApiUrl") or "")
+    if not same_origin(document_url, origin):
+        raise RuntimeError("OpenAPI document left the verified origin")
+    hostname = str((job.get("target") or {}).get("hostname") or "").lower().rstrip(".")
+    basic_control_check(config, job, None)
+    if hostname:
+        assert_public_dns(hostname)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), ScopedRedirectHandler(origin))
+    request = urllib.request.Request(
+        document_url,
+        method="GET",
+        headers={"user-agent": "AegisScope-OpenAPI-Inventory/0.1", "accept": "application/json"},
+    )
+    try:
+        with opener.open(request, timeout=15) as response:
+            raw = response.read(maximum_bytes + 1)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"OpenAPI document returned HTTP {error.code}") from error
+    if len(raw) > maximum_bytes:
+        raise RuntimeError("OpenAPI document exceeded the size safety ceiling")
+    try:
+        document = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise RuntimeError("OpenAPI document is not valid JSON") from error
+    inventory = parse_openapi_inventory(document, origin, maximum_endpoints)
+    inventory["finding"] = openapi_inventory_finding(document_url, inventory, maximum_endpoints)
+    return inventory
 
 
 def resilience_finding(origin: str, observation: dict[str, Any]) -> dict[str, Any]:
@@ -809,6 +943,41 @@ def run_job(config: Config, job: dict[str, Any]) -> None:
                 requests=observation["requestsSent"],
                 rateLimitObserved=observation["observed"],
                 stoppedReason=observation["stoppedReason"],
+            )
+            return
+        if job.get("mode") == "api":
+            progress(config, current_job_id, "Reading bounded OpenAPI document", 15)
+            inventory = run_openapi_inventory(config, job, origin)
+            operation_count = len(inventory["operations"])
+            progress(
+                config,
+                current_job_id,
+                "Normalizing API operation inventory",
+                85,
+                endpointsDiscovered=operation_count,
+                requestsSent=1,
+            )
+            complete(
+                config,
+                current_job_id,
+                {
+                    "status": "completed",
+                    "findings": [inventory["finding"]],
+                    "stats": {
+                        "endpointsDiscovered": operation_count,
+                        "requestsSent": 1,
+                        "candidatesFound": 1,
+                        "activeRequests": 0,
+                        "activeTruncated": inventory["truncated"],
+                    },
+                },
+            )
+            log(
+                "api_inventory_completed",
+                jobId=current_job_id,
+                operations=operation_count,
+                documentRequests=1,
+                truncated=inventory["truncated"],
             )
             return
         progress(config, current_job_id, "Preparing isolated crawler", 4)

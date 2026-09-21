@@ -1,4 +1,4 @@
-name: Basic and resilience engine validation
+name: Basic, resilience and API inventory validation
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: aegis-scope-basic-engine-validation
+  group: aegis-scope-engine-validation
   cancel-in-progress: true
 
 jobs:
@@ -28,7 +28,7 @@ jobs:
       - name: Build isolated scanner
         run: docker build --pull --tag aegis-scope-scanner:validation .
 
-      - name: Validate SQLi, reflected XSS and safe rate limiting
+      - name: Validate SQLi, reflected XSS, safe rate limiting and OpenAPI inventory
         run: |
           docker run --rm \
             --network none \

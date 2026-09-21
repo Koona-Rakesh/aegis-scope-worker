@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate bounded Basic and safe resilience engines against the loopback lab."""
+"""Validate Basic, safe resilience and passive OpenAPI engines in loopback."""
 
 from __future__ import annotations
 
@@ -119,6 +119,27 @@ def main() -> int:
             raise AssertionError("Safe resilience observer did not identify the lab throttle")
         if resilience["requestsSent"] > 12 or resilience["truncated"]:
             raise AssertionError("Safe resilience observer violated its request or health boundary")
+        api_job = {
+            "id": "loopback-openapi-lab",
+            "mode": "api",
+            "policy": {
+                "activeScan": False,
+                "apiDiscovery": True,
+                "openApiUrl": f"{lab.origin}/openapi.json",
+                "allowedMethods": ["GET"],
+                "maxRequests": 1,
+                "maxDocumentBytes": 2_000_000,
+                "maxEndpoints": 500,
+                "resolveExternalReferences": False,
+            },
+        }
+        api_inventory = worker.run_openapi_inventory(config, api_job, lab.origin)
+        if len(api_inventory["operations"]) != 3:
+            raise AssertionError("OpenAPI inventory did not return the three documented operations")
+        if lab._openapi_requests != 1:
+            raise AssertionError("OpenAPI inventory exceeded its one-document request boundary")
+        if api_inventory["truncated"]:
+            raise AssertionError("OpenAPI inventory unexpectedly reached its operation ceiling")
         print(json.dumps({
             "status": "passed",
             "scope": "loopback-only",
@@ -130,6 +151,10 @@ def main() -> int:
             "rateLimitObserved": resilience["observed"],
             "rateLimitRequests": resilience["requestsSent"],
             "rateLimitRequestBudget": resilience["requestBudget"],
+            "openApiOperations": len(api_inventory["operations"]),
+            "openApiDocumentRequests": lab._openapi_requests,
+            "openApiOperationBudget": 500,
+            "openApiOperationsInvoked": 0,
         }, separators=(",", ":")))
         return 0
     finally:

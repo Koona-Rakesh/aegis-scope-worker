@@ -46,7 +46,7 @@ class WorkerPolicyTests(unittest.TestCase):
     def test_rejects_advanced_mode(self, _dns):
         job = self.job()
         job["mode"] = "advanced"
-        with self.assertRaisesRegex(RuntimeError, "Standard, Basic and Safe resilience"):
+        with self.assertRaisesRegex(RuntimeError, "passive API inventory"):
             worker.enforce_policy(job)
 
     @patch.object(worker, "assert_public_dns")
@@ -81,6 +81,40 @@ class WorkerPolicyTests(unittest.TestCase):
         })
         self.assertEqual(worker.enforce_policy(job), ("https://example.com", "example.com"))
         dns.assert_called_once_with("example.com")
+
+    @patch.object(worker, "assert_public_dns")
+    def test_accepts_passive_openapi_inventory_policy(self, dns):
+        job = self.job()
+        job["mode"] = "api"
+        job["policy"].update({
+            "activeScan": False,
+            "apiDiscovery": True,
+            "openApiUrl": "https://example.com/openapi.json",
+            "allowedMethods": ["GET"],
+            "maxRequests": 1,
+            "maxDocumentBytes": 2_000_000,
+            "maxEndpoints": 500,
+            "resolveExternalReferences": False,
+        })
+        self.assertEqual(worker.enforce_policy(job), ("https://example.com", "example.com"))
+        dns.assert_called_once_with("example.com")
+
+    @patch.object(worker, "assert_public_dns")
+    def test_rejects_cross_origin_openapi_document(self, _dns):
+        job = self.job()
+        job["mode"] = "api"
+        job["policy"].update({
+            "activeScan": False,
+            "apiDiscovery": True,
+            "openApiUrl": "https://docs.example.net/openapi.json",
+            "allowedMethods": ["GET"],
+            "maxRequests": 1,
+            "maxDocumentBytes": 2_000_000,
+            "maxEndpoints": 500,
+            "resolveExternalReferences": False,
+        })
+        with self.assertRaisesRegex(RuntimeError, "verified origin"):
+            worker.enforce_policy(job)
 
     @patch.object(worker, "assert_public_dns")
     def test_rejects_resilience_request_volume_above_ceiling(self, _dns):
@@ -311,6 +345,28 @@ class WorkerPolicyTests(unittest.TestCase):
         })
         self.assertEqual(finding["severity"], "Info")
         self.assertIsNone(finding["cwe"])
+
+    def test_parses_openapi_inventory_without_invoking_operations(self):
+        inventory = worker.parse_openapi_inventory({
+            "openapi": "3.1.0",
+            "info": {"title": "Orders API"},
+            "paths": {
+                "/orders": {"get": {"operationId": "listOrders"}, "post": {"operationId": "createOrder"}},
+                "/orders/{id}": {"get": {"operationId": "getOrder"}, "parameters": []},
+            },
+        }, "https://example.com", 500)
+        self.assertEqual(inventory["title"], "Orders API")
+        self.assertEqual(len(inventory["operations"]), 3)
+        self.assertEqual(inventory["methodCounts"], {"GET": 2, "POST": 1})
+        self.assertFalse(inventory["truncated"])
+
+    def test_openapi_inventory_honors_operation_ceiling(self):
+        inventory = worker.parse_openapi_inventory({
+            "swagger": "2.0",
+            "paths": {f"/items/{index}": {"get": {}} for index in range(4)},
+        }, "https://example.com", 2)
+        self.assertEqual(len(inventory["operations"]), 2)
+        self.assertTrue(inventory["truncated"])
 
     def test_boolean_env(self):
         with patch.dict(worker.os.environ, {"RUN_ONCE": "true"}, clear=False):
