@@ -3,8 +3,8 @@
 Open-source deployment source for the AegisScope scanner worker.
 
 The worker runs the official OWASP ZAP stable image and accepts authorized
-Standard passive scans, bounded Basic scans, separate safe resilience and passive OpenAPI inventory
-observations from the AegisScope control plane. It enforces one verified HTTPS
+Standard passive scans, bounded Basic scans, separate safe resilience, passive OpenAPI inventory,
+and specification-free API surface observations from the AegisScope control plane. It enforces one verified HTTPS
 origin, blocks private/reserved DNS answers, normalizes findings, renews job
 leases through progress callbacks, and handles shutdown signals safely.
 
@@ -18,6 +18,8 @@ leases through progress callbacks, and handles shutdown signals safely.
 - Safe resilience is a separate mode: 12 sequential GET requests, 500 ms minimum spacing, 30 seconds maximum
 - Safe resilience requires an explicit staging-or-maintenance confirmation and aborts on 5xx, slow responses, request failures or out-of-scope redirects
 - Pro API inventory fetches one same-origin OpenAPI 3.x or Swagger 2.0 JSON document, caps it at 2 MB and 500 operations, never invokes documented operations and never resolves external references
+- Pro API surface discovery works without a specification by reading the verified homepage and at most nine same-origin public JavaScript assets
+- Specification-free discovery is capped at 10 GETs, 1 MB per asset, 4 MB total and 200 endpoint references; discovered endpoints are never invoked
 - Exact verified HTTPS origin and control-plane allowlist required
 - Private, reserved, loopback, multicast, and link-local DNS answers rejected
 - ZAP API listens on `127.0.0.1` with a generated API key

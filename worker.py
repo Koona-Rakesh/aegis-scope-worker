@@ -4,8 +4,8 @@
 The worker claims authorized jobs from the AegisScope control plane and drives
 the OWASP ZAP daemon bundled in the official stable container image. It only
 accepts Standard passive scans, tightly bounded Basic active scans, a separate
-low-rate resilience observation, and passive OpenAPI inventory against one
-verified HTTPS origin.
+low-rate resilience observation, passive OpenAPI inventory, and bounded
+specification-free API surface discovery against one verified HTTPS origin.
 """
 
 from __future__ import annotations
@@ -38,7 +38,21 @@ RESILIENCE_MAX_DURATION_SECONDS = 30
 RESILIENCE_MIN_INTERVAL_MILLISECONDS = 500
 API_MAX_DOCUMENT_BYTES = 2_000_000
 API_MAX_ENDPOINTS = 500
+API_SURFACE_MAX_REQUESTS = 10
+API_SURFACE_MAX_ASSET_BYTES = 1_000_000
+API_SURFACE_MAX_TOTAL_BYTES = 4_000_000
+API_SURFACE_MAX_ENDPOINTS = 200
 OPENAPI_OPERATION_METHODS = frozenset({"get", "post", "put", "patch", "delete", "options", "head", "trace"})
+API_PATH_PATTERN = re.compile(
+    r'''["'`](\/(?:api|graphql|rest|v[1-9][0-9]*|auth)(?:\/[A-Za-z0-9._~!$&()*+,;=:@%{}\-]*)*(?:\?[A-Za-z0-9._~!$&()*+,;=:@%{}\-\/?]*)?)["'`]''',
+    re.IGNORECASE,
+)
+SCRIPT_SOURCE_PATTERN = re.compile(r'''<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>''', re.IGNORECASE)
+SENSITIVE_API_TERMS = frozenset({
+    "admin", "account", "accounts", "auth", "billing", "delete", "invoice", "invoices",
+    "order", "orders", "password", "payment", "payments", "profile", "reset", "role",
+    "roles", "token", "upload", "user", "users",
+})
 RATE_LIMIT_HEADERS = frozenset({
     "ratelimit-limit",
     "ratelimit-remaining",
@@ -272,7 +286,7 @@ def enforce_policy(job: dict[str, Any]) -> tuple[str, str]:
         raise RuntimeError("Job origin is outside its allowlist")
     mode = job.get("mode")
     if mode not in ("standard", "basic", "resilience", "api"):
-        raise RuntimeError("Worker permits only Standard, Basic, Safe resilience and passive API inventory assessments")
+        raise RuntimeError("Worker permits only Standard, Basic, Safe resilience and passive API surface assessments")
     if mode == "standard" and policy.get("activeScan") not in (None, False):
         raise RuntimeError("Standard assessments must remain passive")
     if mode == "basic":
@@ -323,19 +337,29 @@ def validate_resilience_policy(policy: dict[str, Any]) -> None:
 
 def validate_api_policy(policy: dict[str, Any], origin: str) -> None:
     if policy.get("activeScan") is not False or policy.get("apiDiscovery") is not True:
-        raise RuntimeError("API inventory requires its dedicated passive policy")
-    if policy.get("allowedMethods") != ["GET"] or policy.get("maxRequests") != 1:
-        raise RuntimeError("API inventory permits one OpenAPI document GET only")
+        raise RuntimeError("API surface review requires its dedicated passive policy")
+    if policy.get("allowedMethods") != ["GET"]:
+        raise RuntimeError("API surface review permits GET requests only")
     if policy.get("resolveExternalReferences") is not False:
-        raise RuntimeError("API inventory cannot resolve external references")
-    policy_integer(policy, "maxDocumentBytes", 1, API_MAX_DOCUMENT_BYTES)
-    policy_integer(policy, "maxEndpoints", 1, API_MAX_ENDPOINTS)
+        raise RuntimeError("API surface review cannot resolve external references")
     document_url = str(policy.get("openApiUrl") or "")
-    if not same_origin(document_url, origin):
-        raise RuntimeError("OpenAPI document left the verified origin")
-    parsed = urllib.parse.urlsplit(document_url)
-    if parsed.scheme != "https" or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path in ("", "/"):
-        raise RuntimeError("OpenAPI document URL violates the passive inventory boundary")
+    if document_url:
+        if policy.get("maxRequests") != 1:
+            raise RuntimeError("API inventory permits one OpenAPI document GET only")
+        policy_integer(policy, "maxDocumentBytes", 1, API_MAX_DOCUMENT_BYTES)
+        policy_integer(policy, "maxEndpoints", 1, API_MAX_ENDPOINTS)
+        if not same_origin(document_url, origin):
+            raise RuntimeError("OpenAPI document left the verified origin")
+        parsed = urllib.parse.urlsplit(document_url)
+        if parsed.scheme != "https" or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path in ("", "/"):
+            raise RuntimeError("OpenAPI document URL violates the passive inventory boundary")
+        return
+    if policy.get("apiSurfaceDiscovery") is not True:
+        raise RuntimeError("Specification-free API review requires an explicit discovery policy")
+    policy_integer(policy, "maxRequests", 1, API_SURFACE_MAX_REQUESTS)
+    policy_integer(policy, "maxAssetBytes", 1, API_SURFACE_MAX_ASSET_BYTES)
+    policy_integer(policy, "maxTotalBytes", 1, API_SURFACE_MAX_TOTAL_BYTES)
+    policy_integer(policy, "maxEndpoints", 1, API_SURFACE_MAX_ENDPOINTS)
 
 
 def assert_public_dns(hostname: str) -> None:
@@ -574,6 +598,174 @@ def run_openapi_inventory(config: Config, job: dict[str, Any], origin: str) -> d
     inventory = parse_openapi_inventory(document, origin, maximum_endpoints)
     inventory["finding"] = openapi_inventory_finding(document_url, inventory, maximum_endpoints)
     return inventory
+
+
+def first_party_script_urls(html: str, origin: str, maximum: int) -> list[str]:
+    if maximum <= 0:
+        return []
+    urls: list[str] = []
+    for raw_source in SCRIPT_SOURCE_PATTERN.findall(html):
+        candidate = urllib.parse.urljoin(f"{origin}/", raw_source.strip())
+        if not same_origin(candidate, origin):
+            continue
+        try:
+            parsed = urllib.parse.urlsplit(candidate)
+        except ValueError:
+            continue
+        if parsed.username or parsed.password or parsed.fragment:
+            continue
+        normalized = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
+        if normalized not in urls:
+            urls.append(normalized)
+        if len(urls) >= maximum:
+            break
+    return urls
+
+
+def discover_api_references(documents: list[str], origin: str, maximum: int) -> dict[str, Any]:
+    endpoints: list[str] = []
+    sensitive: list[str] = []
+    for document in documents:
+        for raw_path in API_PATH_PATTERN.findall(document):
+            path = raw_path.replace("\\/", "/")
+            try:
+                parsed_path = urllib.parse.urlsplit(path)
+            except ValueError:
+                continue
+            normalized_path = parsed_path.path or "/"
+            if len(normalized_path) > 500 or normalized_path.lower().endswith((".css", ".gif", ".ico", ".jpg", ".jpeg", ".js", ".png", ".svg", ".webp")):
+                continue
+            endpoint = urllib.parse.urljoin(f"{origin}/", normalized_path.lstrip("/"))
+            if not same_origin(endpoint, origin) or endpoint in endpoints:
+                continue
+            endpoints.append(endpoint)
+            terms = {part.lower() for part in re.split(r"[^A-Za-z0-9]+", normalized_path) if part}
+            if terms.intersection(SENSITIVE_API_TERMS):
+                sensitive.append(endpoint)
+            if len(endpoints) >= maximum:
+                return {"endpoints": endpoints, "sensitiveEndpoints": sensitive, "truncated": True}
+    return {"endpoints": endpoints, "sensitiveEndpoints": sensitive, "truncated": False}
+
+
+def bounded_surface_get(endpoint: str, origin: str, maximum_bytes: int, total_remaining: int) -> dict[str, Any]:
+    if not same_origin(endpoint, origin):
+        raise RuntimeError("API discovery asset left the verified origin")
+    read_limit = min(maximum_bytes, total_remaining)
+    if read_limit < 1:
+        raise RuntimeError("API discovery reached its total byte ceiling")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), ScopedRedirectHandler(origin))
+    request = urllib.request.Request(
+        endpoint,
+        method="GET",
+        headers={
+            "user-agent": "AegisScope-API-Surface/0.1",
+            "accept": "text/html,application/javascript,text/javascript;q=0.9,*/*;q=0.1",
+        },
+    )
+    try:
+        with opener.open(request, timeout=15) as response:
+            content_length = response.headers.get("content-length")
+            if content_length:
+                try:
+                    if int(content_length) > read_limit:
+                        raise RuntimeError("API discovery asset exceeded its byte ceiling")
+                except ValueError:
+                    pass
+            raw = response.read(read_limit + 1)
+            content_type = str(response.headers.get("content-type") or "").lower()
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"API discovery asset returned HTTP {error.code}") from error
+    if len(raw) > read_limit:
+        raise RuntimeError("API discovery asset exceeded its byte ceiling")
+    return {
+        "text": raw.decode("utf-8", errors="replace"),
+        "bytes": len(raw),
+        "contentType": content_type,
+    }
+
+
+def api_surface_finding(origin: str, discovery: dict[str, Any], maximum: int) -> dict[str, Any]:
+    endpoints = discovery["endpoints"]
+    sensitive = discovery["sensitiveEndpoints"]
+    title = "First-party API references discovered" if endpoints else "No API references found in bounded public assets"
+    evidence = (
+        f"Reviewed {discovery['requestsSent']} same-origin public documents ({discovery['bytesRead']} bytes); "
+        f"API references: {len(endpoints)}/{maximum}; sensitive-name review signals: {len(sensitive)}; "
+        "authentication credentials: not supplied; discovered operations: not invoked."
+    )
+    if discovery["truncated"]:
+        evidence += " Discovery stopped at a configured request, byte or endpoint ceiling."
+    return {
+        "fingerprint": hashlib.sha256(f"api-surface-discovery-v1|{origin}".encode()).hexdigest(),
+        "pluginId": "aegis-api-surface-discovery-v1",
+        "title": title,
+        "severity": "Info",
+        "confidence": "Medium",
+        "endpoint": origin,
+        "observationCount": max(1, len(endpoints)),
+        "affectedEndpoints": endpoints or [origin],
+        "parameter": "",
+        "category": "API inventory",
+        "cwe": None,
+        "evidence": truncate(evidence, 8000),
+        "impact": "This is passive attack-surface evidence, not a confirmed vulnerability. Public client code may reveal routes worth reviewing, but it does not prove that a route exists, is reachable or lacks authorization.",
+        "remediation": [
+            "Maintain an OpenAPI document so intended operations, authentication and schemas can be reviewed accurately.",
+            "Confirm every sensitive route enforces server-side authentication and object-level authorization.",
+            "Remove obsolete endpoint references and sensitive implementation details from production client bundles.",
+        ],
+    }
+
+
+def run_api_surface_discovery(config: Config, job: dict[str, Any], origin: str) -> dict[str, Any]:
+    policy = job["policy"]
+    maximum_requests = policy_integer(policy, "maxRequests", 1, API_SURFACE_MAX_REQUESTS)
+    maximum_asset_bytes = policy_integer(policy, "maxAssetBytes", 1, API_SURFACE_MAX_ASSET_BYTES)
+    maximum_total_bytes = policy_integer(policy, "maxTotalBytes", 1, API_SURFACE_MAX_TOTAL_BYTES)
+    maximum_endpoints = policy_integer(policy, "maxEndpoints", 1, API_SURFACE_MAX_ENDPOINTS)
+    hostname = str((job.get("target") or {}).get("hostname") or "").lower().rstrip(".")
+    documents: list[str] = []
+    requests_sent = 0
+    bytes_read = 0
+
+    basic_control_check(config, job, None)
+    if hostname:
+        assert_public_dns(hostname)
+    homepage = bounded_surface_get(origin, origin, maximum_asset_bytes, maximum_total_bytes)
+    requests_sent += 1
+    bytes_read += homepage["bytes"]
+    documents.append(homepage["text"])
+
+    script_urls = first_party_script_urls(homepage["text"], origin, max(0, maximum_requests - 1))
+    truncated = len(SCRIPT_SOURCE_PATTERN.findall(homepage["text"])) > len(script_urls)
+    for script_url in script_urls:
+        if requests_sent >= maximum_requests or bytes_read >= maximum_total_bytes:
+            truncated = True
+            break
+        basic_control_check(config, job, None)
+        if hostname:
+            assert_public_dns(hostname)
+        asset = bounded_surface_get(script_url, origin, maximum_asset_bytes, maximum_total_bytes - bytes_read)
+        requests_sent += 1
+        bytes_read += asset["bytes"]
+        documents.append(asset["text"])
+        progress(
+            config,
+            str(job.get("id") or ""),
+            "Reviewing first-party API references",
+            min(80, 20 + round(60 * requests_sent / maximum_requests)),
+            requestsSent=requests_sent,
+        )
+
+    discovery = discover_api_references(documents, origin, maximum_endpoints)
+    discovery.update({
+        "requestsSent": requests_sent,
+        "bytesRead": bytes_read,
+        "assetsReviewed": len(documents),
+        "truncated": truncated or discovery["truncated"],
+    })
+    discovery["finding"] = api_surface_finding(origin, discovery, maximum_endpoints)
+    return discovery
 
 
 def resilience_finding(origin: str, observation: dict[str, Any]) -> dict[str, Any]:
@@ -946,16 +1138,23 @@ def run_job(config: Config, job: dict[str, Any]) -> None:
             )
             return
         if job.get("mode") == "api":
-            progress(config, current_job_id, "Reading bounded OpenAPI document", 15)
-            inventory = run_openapi_inventory(config, job, origin)
-            operation_count = len(inventory["operations"])
+            has_openapi_document = bool((job.get("policy") or {}).get("openApiUrl"))
             progress(
                 config,
                 current_job_id,
-                "Normalizing API operation inventory",
+                "Reading bounded OpenAPI document" if has_openapi_document else "Reviewing public first-party API surface",
+                15,
+            )
+            inventory = run_openapi_inventory(config, job, origin) if has_openapi_document else run_api_surface_discovery(config, job, origin)
+            operation_count = len(inventory.get("operations") or inventory.get("endpoints") or [])
+            requests_sent = 1 if has_openapi_document else int(inventory["requestsSent"])
+            progress(
+                config,
+                current_job_id,
+                "Normalizing API surface inventory",
                 85,
                 endpointsDiscovered=operation_count,
-                requestsSent=1,
+                requestsSent=requests_sent,
             )
             complete(
                 config,
@@ -965,7 +1164,7 @@ def run_job(config: Config, job: dict[str, Any]) -> None:
                     "findings": [inventory["finding"]],
                     "stats": {
                         "endpointsDiscovered": operation_count,
-                        "requestsSent": 1,
+                        "requestsSent": requests_sent,
                         "candidatesFound": 1,
                         "activeRequests": 0,
                         "activeTruncated": inventory["truncated"],
@@ -973,10 +1172,11 @@ def run_job(config: Config, job: dict[str, Any]) -> None:
                 },
             )
             log(
-                "api_inventory_completed",
+                "api_surface_review_completed",
                 jobId=current_job_id,
                 operations=operation_count,
-                documentRequests=1,
+                documentRequests=requests_sent,
+                source="openapi" if has_openapi_document else "first_party_assets",
                 truncated=inventory["truncated"],
             )
             return

@@ -46,7 +46,7 @@ class WorkerPolicyTests(unittest.TestCase):
     def test_rejects_advanced_mode(self, _dns):
         job = self.job()
         job["mode"] = "advanced"
-        with self.assertRaisesRegex(RuntimeError, "passive API inventory"):
+        with self.assertRaisesRegex(RuntimeError, "passive API surface"):
             worker.enforce_policy(job)
 
     @patch.object(worker, "assert_public_dns")
@@ -98,6 +98,42 @@ class WorkerPolicyTests(unittest.TestCase):
         })
         self.assertEqual(worker.enforce_policy(job), ("https://example.com", "example.com"))
         dns.assert_called_once_with("example.com")
+
+    @patch.object(worker, "assert_public_dns")
+    def test_accepts_specification_free_api_surface_policy(self, dns):
+        job = self.job()
+        job["mode"] = "api"
+        job["policy"].update({
+            "activeScan": False,
+            "apiDiscovery": True,
+            "apiSurfaceDiscovery": True,
+            "allowedMethods": ["GET"],
+            "maxRequests": 10,
+            "maxAssetBytes": 1_000_000,
+            "maxTotalBytes": 4_000_000,
+            "maxEndpoints": 200,
+            "resolveExternalReferences": False,
+        })
+        self.assertEqual(worker.enforce_policy(job), ("https://example.com", "example.com"))
+        dns.assert_called_once_with("example.com")
+
+    @patch.object(worker, "assert_public_dns")
+    def test_rejects_api_surface_request_volume_above_ceiling(self, _dns):
+        job = self.job()
+        job["mode"] = "api"
+        job["policy"].update({
+            "activeScan": False,
+            "apiDiscovery": True,
+            "apiSurfaceDiscovery": True,
+            "allowedMethods": ["GET"],
+            "maxRequests": 11,
+            "maxAssetBytes": 1_000_000,
+            "maxTotalBytes": 4_000_000,
+            "maxEndpoints": 200,
+            "resolveExternalReferences": False,
+        })
+        with self.assertRaisesRegex(RuntimeError, "maxRequests"):
+            worker.enforce_policy(job)
 
     @patch.object(worker, "assert_public_dns")
     def test_rejects_cross_origin_openapi_document(self, _dns):
@@ -367,6 +403,73 @@ class WorkerPolicyTests(unittest.TestCase):
         }, "https://example.com", 2)
         self.assertEqual(len(inventory["operations"]), 2)
         self.assertTrue(inventory["truncated"])
+
+    def test_discovers_only_same_origin_script_assets(self):
+        html = """
+        <script src="/assets/app.js"></script>
+        <script src="https://example.com/assets/vendor.js?v=2"></script>
+        <script src="https://third-party.example/tracker.js"></script>
+        <script src="/assets/app.js"></script>
+        """
+        self.assertEqual(worker.first_party_script_urls(html, "https://example.com", 5), [
+            "https://example.com/assets/app.js",
+            "https://example.com/assets/vendor.js?v=2",
+        ])
+
+    def test_discovers_api_references_without_calling_operations(self):
+        discovery = worker.discover_api_references([
+            'fetch("/api/orders")\nconst profile = "/api/users/{id}";',
+            'const graph = `/graphql`; const image = "/api/logo.svg";',
+        ], "https://example.com", 200)
+        self.assertEqual(discovery["endpoints"], [
+            "https://example.com/api/orders",
+            "https://example.com/api/users/{id}",
+            "https://example.com/graphql",
+        ])
+        self.assertEqual(discovery["sensitiveEndpoints"], [
+            "https://example.com/api/orders",
+            "https://example.com/api/users/{id}",
+        ])
+        self.assertFalse(discovery["truncated"])
+
+    def test_api_reference_discovery_honors_endpoint_ceiling(self):
+        discovery = worker.discover_api_references([
+            '"/api/one"; "/api/two"; "/api/three";'
+        ], "https://example.com", 2)
+        self.assertEqual(len(discovery["endpoints"]), 2)
+        self.assertTrue(discovery["truncated"])
+
+    @patch.object(worker, "progress")
+    @patch.object(worker, "assert_public_dns")
+    @patch.object(worker, "basic_control_check")
+    @patch.object(worker, "bounded_surface_get")
+    def test_api_surface_reviews_assets_but_does_not_call_discovered_endpoints(
+        self, bounded_get, _control_check, _dns, _progress,
+    ):
+        bounded_get.side_effect = [
+            {"text": '<script src="/assets/app.js"></script>', "bytes": 45, "contentType": "text/html"},
+            {"text": 'fetch("/api/orders")', "bytes": 20, "contentType": "application/javascript"},
+        ]
+        job = self.job()
+        job["mode"] = "api"
+        job["policy"].update({
+            "activeScan": False,
+            "apiDiscovery": True,
+            "apiSurfaceDiscovery": True,
+            "allowedMethods": ["GET"],
+            "maxRequests": 10,
+            "maxAssetBytes": 1_000_000,
+            "maxTotalBytes": 4_000_000,
+            "maxEndpoints": 200,
+            "resolveExternalReferences": False,
+        })
+        discovery = worker.run_api_surface_discovery(self.config(), job, "https://example.com")
+        self.assertEqual(discovery["endpoints"], ["https://example.com/api/orders"])
+        self.assertEqual(discovery["requestsSent"], 2)
+        self.assertEqual([call.args[0] for call in bounded_get.call_args_list], [
+            "https://example.com",
+            "https://example.com/assets/app.js",
+        ])
 
     def test_boolean_env(self):
         with patch.dict(worker.os.environ, {"RUN_ONCE": "true"}, clear=False):
