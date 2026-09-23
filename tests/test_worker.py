@@ -439,6 +439,25 @@ class WorkerPolicyTests(unittest.TestCase):
         self.assertEqual(len(discovery["endpoints"]), 2)
         self.assertTrue(discovery["truncated"])
 
+    @patch.object(worker.urllib.request, "Request")
+    @patch.object(worker.urllib.request, "build_opener")
+    def test_bounded_surface_get_truncates_oversized_asset(self, build_opener, request):
+        response = Mock()
+        response.read.return_value = b"123456"
+        response.headers = {"content-type": "text/html", "content-length": "999999"}
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        opener = Mock()
+        opener.open.return_value = response
+        build_opener.return_value = opener
+        request.return_value = Mock()
+
+        asset = worker.bounded_surface_get("https://example.com", "https://example.com", 5, 10)
+
+        self.assertEqual(asset["text"], "12345")
+        self.assertEqual(asset["bytes"], 5)
+        self.assertTrue(asset["truncated"])
+
     @patch.object(worker, "progress")
     @patch.object(worker, "assert_public_dns")
     @patch.object(worker, "basic_control_check")
@@ -447,8 +466,8 @@ class WorkerPolicyTests(unittest.TestCase):
         self, bounded_get, _control_check, _dns, _progress,
     ):
         bounded_get.side_effect = [
-            {"text": '<script src="/assets/app.js"></script>', "bytes": 45, "contentType": "text/html"},
-            {"text": 'fetch("/api/orders")', "bytes": 20, "contentType": "application/javascript"},
+            {"text": '<script src="/assets/app.js"></script>', "bytes": 45, "contentType": "text/html", "truncated": True},
+            {"text": 'fetch("/api/orders")', "bytes": 20, "contentType": "application/javascript", "truncated": False},
         ]
         job = self.job()
         job["mode"] = "api"
@@ -466,6 +485,7 @@ class WorkerPolicyTests(unittest.TestCase):
         discovery = worker.run_api_surface_discovery(self.config(), job, "https://example.com")
         self.assertEqual(discovery["endpoints"], ["https://example.com/api/orders"])
         self.assertEqual(discovery["requestsSent"], 2)
+        self.assertTrue(discovery["truncated"])
         self.assertEqual([call.args[0] for call in bounded_get.call_args_list], [
             "https://example.com",
             "https://example.com/assets/app.js",

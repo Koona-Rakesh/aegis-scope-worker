@@ -664,23 +664,18 @@ def bounded_surface_get(endpoint: str, origin: str, maximum_bytes: int, total_re
     )
     try:
         with opener.open(request, timeout=15) as response:
-            content_length = response.headers.get("content-length")
-            if content_length:
-                try:
-                    if int(content_length) > read_limit:
-                        raise RuntimeError("API discovery asset exceeded its byte ceiling")
-                except ValueError:
-                    pass
             raw = response.read(read_limit + 1)
             content_type = str(response.headers.get("content-type") or "").lower()
     except urllib.error.HTTPError as error:
         raise RuntimeError(f"API discovery asset returned HTTP {error.code}") from error
-    if len(raw) > read_limit:
-        raise RuntimeError("API discovery asset exceeded its byte ceiling")
+    truncated = len(raw) > read_limit
+    if truncated:
+        raw = raw[:read_limit]
     return {
         "text": raw.decode("utf-8", errors="replace"),
         "bytes": len(raw),
         "contentType": content_type,
+        "truncated": truncated,
     }
 
 
@@ -737,7 +732,7 @@ def run_api_surface_discovery(config: Config, job: dict[str, Any], origin: str) 
     documents.append(homepage["text"])
 
     script_urls = first_party_script_urls(homepage["text"], origin, max(0, maximum_requests - 1))
-    truncated = len(SCRIPT_SOURCE_PATTERN.findall(homepage["text"])) > len(script_urls)
+    truncated = bool(homepage.get("truncated")) or len(SCRIPT_SOURCE_PATTERN.findall(homepage["text"])) > len(script_urls)
     for script_url in script_urls:
         if requests_sent >= maximum_requests or bytes_read >= maximum_total_bytes:
             truncated = True
@@ -749,6 +744,7 @@ def run_api_surface_discovery(config: Config, job: dict[str, Any], origin: str) 
         requests_sent += 1
         bytes_read += asset["bytes"]
         documents.append(asset["text"])
+        truncated = bool(asset.get("truncated")) or truncated
         progress(
             config,
             str(job.get("id") or ""),
